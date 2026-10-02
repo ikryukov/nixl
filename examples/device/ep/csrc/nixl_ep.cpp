@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cuda.h>
 #include <cstdio>
 #include <limits>
 #include <unordered_set>
@@ -52,6 +53,62 @@ uint64_t milliseconds_to_cycles(uint64_t milliseconds, int device_clock_rate_khz
 }
 
 } // namespace
+
+// NVL buffers over CUDA fabric handles so that an NVL group can span nodes of one NVLink domain (GB200 NVL72,
+// 4 GPUs per node). The 64 B CUmemFabricHandle travels in the cudaIpcMemHandle_t slot.
+static void nvl_cu_check(CUresult r, const char* what) {
+    if (r != CUDA_SUCCESS) {
+        const char* msg = nullptr;
+        cuGetErrorString(r, &msg);
+        throw std::runtime_error(std::string("nvl fabric: ") + what + ": " + (msg ? msg : "?"));
+    }
+}
+
+static CUmemAllocationProp nvl_fabric_prop(size_t* size) {
+    CUdevice dev;
+    nvl_cu_check(cuCtxGetDevice(&dev), "cuCtxGetDevice");
+    CUmemAllocationProp p = {};
+    p.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    p.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    p.location.id = dev;
+    p.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    size_t g = 0;
+    nvl_cu_check(cuMemGetAllocationGranularity(&g, &p, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED), "granularity");
+    *size = (*size + g - 1) / g * g;
+    return p;
+}
+
+static void* nvl_fabric_map(CUmemGenericAllocationHandle h, size_t size, int dev) {
+    CUdeviceptr ptr;
+    nvl_cu_check(cuMemAddressReserve(&ptr, size, 0, 0, 0), "cuMemAddressReserve");
+    nvl_cu_check(cuMemMap(ptr, size, 0, h, 0), "cuMemMap");
+    CUmemAccessDesc a = {};
+    a.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    a.location.id = dev;
+    a.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    nvl_cu_check(cuMemSetAccess(ptr, size, &a, 1), "cuMemSetAccess");
+    return reinterpret_cast<void*>(ptr);
+}
+
+static size_t g_nvl_alloc_size = 0;
+
+static void* nvl_fabric_alloc(size_t size, cudaIpcMemHandle_t* out) {
+    auto p = nvl_fabric_prop(&size);
+    g_nvl_alloc_size = size;
+    CUmemGenericAllocationHandle h;
+    nvl_cu_check(cuMemCreate(&h, size, &p, 0), "cuMemCreate");
+    static_assert(sizeof(CUmemFabricHandle) <= sizeof(out->reserved), "fabric handle size");
+    nvl_cu_check(cuMemExportToShareableHandle(out->reserved, h, CU_MEM_HANDLE_TYPE_FABRIC, 0), "export");
+    return nvl_fabric_map(h, size, p.location.id);
+}
+
+static void* nvl_fabric_import(const cudaIpcMemHandle_t& in) {
+    CUdevice dev;
+    nvl_cu_check(cuCtxGetDevice(&dev), "cuCtxGetDevice");
+    CUmemGenericAllocationHandle h;
+    nvl_cu_check(cuMemImportFromShareableHandle(&h, const_cast<char*>(in.reserved), CU_MEM_HANDLE_TYPE_FABRIC), "import");
+    return nvl_fabric_map(h, g_nvl_alloc_size, dev);
+}
 
 namespace nixl_ep {
 
@@ -147,8 +204,8 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
 
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handles
-        CUDA_CHECK(cudaMalloc(&buffer_ptrs[nvl_rank], num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes));
-        CUDA_CHECK(cudaIpcGetMemHandle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]));
+        buffer_ptrs[nvl_rank] = nvl_fabric_alloc(num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes,
+                                                 &ipc_handles[nvl_rank]);
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
         // Set barrier signals
@@ -301,14 +358,7 @@ void Buffer::destroy() {
         intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, timeout_cycles, comm_stream);
         warn_cuda(cudaDeviceSynchronize(), "synchronize device after intranode barrier");
 
-        // Close remote IPC
-        if (is_available()) {
-            for (int i = 0; i < num_nvl_ranks; ++ i) if (i != nvl_rank)
-                warn_cuda(cudaIpcCloseMemHandle(buffer_ptrs[i]), "close remote IPC handle");
-        }
-
-        // Free local buffer
-        warn_cuda(cudaFree(buffer_ptrs[nvl_rank]), "free local NVL buffer");
+        // ponytail: fabric-mapped NVL buffers are released at process exit
     }
 
     if (nixl_agent_info and nixl_agent_info->agent != nullptr) {
@@ -445,7 +495,7 @@ void Buffer::_ipc_handles_sync(const std::vector<std::optional<pybind11::bytearr
             EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
             if (offset + i != rank) {
                 std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
-                CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
+                buffer_ptrs[i] = nvl_fabric_import(ipc_handles[i]);
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
             } else {
                 EP_HOST_ASSERT(std::memcmp(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE) == 0);

@@ -20,6 +20,9 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 
@@ -469,6 +472,38 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
     return num_rdma_ranks < 8 ? num_rdma_ranks : 8;
 }
 
+#ifdef NIXL_EP_WARP_TIMING
+// Per-warp time split of the HT dispatch kernel: [0] lifetime, [1..4] role-specific buckets, [7] role + 1.
+__device__ unsigned long long g_epw[64 * 32 * 8];
+__device__ __forceinline__ long long epw_clk() {
+#ifdef __CUDA_ARCH__
+    return clock64();
+#else
+    return 0;
+#endif
+}
+struct EpWt {
+    long long t0, acc[4] = {0, 0, 0, 0};
+    int role;
+    __device__ explicit EpWt(int r) : t0(epw_clk()), role(r) {}
+    __device__ ~EpWt() {
+        if ((threadIdx.x & 31) == 0) {
+            auto* p = g_epw + (blockIdx.x * 32 + threadIdx.x / 32) * 8;
+            p[0] = epw_clk() - t0;
+            for (int i = 0; i < 4; ++i) p[1 + i] = acc[i];
+            p[7] = role + 1;
+        }
+    }
+};
+#define EPW_BEGIN(v) const long long v = epw_clk()
+#define EPW_RECV_TIMEOUT(t) (2 * (t)) // diagnostics: let upstream stages report their timeout first
+#define EPW_END(v, slot) _wt.acc[slot] += epw_clk() - v
+#else
+#define EPW_BEGIN(v)
+#define EPW_END(v, slot)
+#define EPW_RECV_TIMEOUT(t) (t)
+#endif
+
 template <int kNumRDMARanks,
           bool kCachedMode,
           int kNumTMABytesPerWarp,
@@ -538,6 +573,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     }();
     auto warp_role = role_meta.first;
     auto target_rank = role_meta.second;  // Not applicable for RDMA senders
+#ifdef NIXL_EP_WARP_TIMING
+    EpWt _wt(static_cast<int>(warp_role));
+#endif
     EP_DEVICE_ASSERT(num_warps == kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS);
 
     // Data checks
@@ -672,6 +710,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
 
             // Wait the remote buffer to be released
+            EPW_BEGIN(_w0);
             auto start_time = clock64();
             while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
                 cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
@@ -689,6 +728,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 }
             }
             __syncwarp();
+            EPW_END(_w0, 0);
 
             // Store RDMA head for combine
             if (lane_id < kNumRDMARanks and not kCachedMode)
@@ -713,6 +753,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
 
             // Copy `x` into symmetric send buffer
+            EPW_BEGIN(_w1);
             auto st_broadcast = [=](const int key, const int4& value) {
                 #pragma unroll
                 for (int j = 0; j < num_topk_ranks; ++j)
@@ -753,8 +794,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 st_na_global(reinterpret_cast<float*>(dst_send_buffers[rank_idx]) + num_topk + copy_idx, weight_value);
             }
             __syncwarp();
+            EPW_END(_w1, 1);
 
             // Release the transaction in the window
+            EPW_BEGIN(_w2);
             if (is_token_in_rank_uint64 != 0) {
                 // Acquire lock first
                 acquire_lock(rdma_send_channel_lock + lane_id);
@@ -781,6 +824,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 release_lock(rdma_send_channel_lock + lane_id);
             }
             __syncwarp();
+            EPW_END(_w2, 2);
         }
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
         // NOTES: in case of splitting, the issued put at the end of the buffer
@@ -839,6 +883,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 // Issue RDMA send
                 auto num_tokens_to_issue = min(num_tokens_processed, num_max_rdma_chunked_send_tokens);
                 EP_DEVICE_ASSERT(num_tokens_to_issue >= 0 and num_tokens_to_issue <= synced_num_tokens_to_send);
+                EPW_BEGIN(_c1);
                 if (dst_rdma_rank != rdma_rank) {
                     auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
                     EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
@@ -861,6 +906,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     memory_fence();
                 }
                 __syncwarp();
+                EPW_END(_c1, 1);
+                EPW_BEGIN(_c2);
 
                 // Update tails
                 if (lane_id == dst_rdma_rank) {
@@ -879,6 +926,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     }
                 }
                 __syncwarp();
+                EPW_END(_c2, 2);
             }
         }
     } else if (warp_role == WarpRole::kRDMAAndNVLForwarder) {
@@ -945,6 +993,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
             // Check destination queue emptiness, or wait a buffer to be released
+            EPW_BEGIN(_f3);
             start_time = clock64();
             while (true) {
                 const int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
@@ -966,7 +1015,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 }
             }
 
+            EPW_END(_f3, 3);
             // Find next source RDMA rank (round-robin)
+            EPW_BEGIN(_f0);
             start_time = clock64();
             while (true) {
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
@@ -999,8 +1050,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             }
             auto src_rdma_head = __shfl_sync(0xffffffff, cached_rdma_channel_head, src_rdma_rank);
             auto src_rdma_tail = __shfl_sync(0xffffffff, cached_rdma_channel_tail, src_rdma_rank);
+            EPW_END(_f0, 0);
 
             // Iterate over every token from the RDMA buffer
+            EPW_BEGIN(_f1);
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++i) {
                 auto rdma_slot_idx = i % num_max_rdma_chunked_recv_tokens;
                 auto shifted = rdma_channel_data.recv_buffer(src_rdma_rank) + rdma_slot_idx * num_bytes_per_token;
@@ -1041,6 +1094,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 __syncwarp();
             }
 
+            EPW_END(_f1, 1);
             // Sync head index
             if (lane_id == src_rdma_rank)
             {
@@ -1118,6 +1172,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
         // Receive channel offsets
         int start_offset = 0, end_offset = 0, num_tokens_to_recv;
+        EPW_BEGIN(_r0);
         auto start_time = clock64();
         while (lane_id < kNumRDMARanks) {
             start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
@@ -1129,7 +1184,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             }
 
             // Timeout check
-            if (clock64() - start_time > timeout_cycles) {
+            if (clock64() - start_time > EPW_RECV_TIMEOUT(timeout_cycles)) {
                 printf(
                     "NixlEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d, start: %d, end: %d\n",
                     channel_id,
@@ -1143,6 +1198,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             }
         }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
+        EPW_END(_r0, 0);
 
         // Save for combine usage
         if (lane_id < kNumRDMARanks and not kCachedMode)
@@ -1152,6 +1208,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
             // Check channel status by lane 0
+            EPW_BEGIN(_r1);
             start_time = clock64();
             while (true) {
                 // Ready to copy
@@ -1160,7 +1217,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 cached_channel_tail_idx = __shfl_sync(0xffffffff, ld_acquire_sys_global(nvl_channel_tail.buffer()), 0);
 
                 // Timeout check
-                if (elect_one_sync() and clock64() - start_time > timeout_cycles) {
+                if (elect_one_sync() and clock64() - start_time > EPW_RECV_TIMEOUT(timeout_cycles)) {
                     printf("NixlEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
                            channel_id,
                            rdma_rank,
@@ -1172,7 +1229,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 }
             }
 
+            EPW_END(_r1, 0);
             // Copy data
+            EPW_BEGIN(_r2);
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++chunk_idx, --num_tokens_to_recv) {
                 int token_idx_in_buffer = (cached_channel_head_idx++) % num_max_nvl_chunked_recv_tokens;
@@ -1237,6 +1296,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 __syncwarp();
             }
 
+            EPW_END(_r2, 1);
             // Move queue
             if (elect_one_sync())
                 st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
@@ -1338,8 +1398,41 @@ break
     EP_HOST_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
 
     SETUP_LAUNCH_CONFIG(num_channels * 2, (kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32, stream);
+#ifdef NIXL_EP_WARP_TIMING
+    const char* wt_env = std::getenv("NIXL_EP_WT_DUMP");
+    const bool wt_dump = wt_env != nullptr && wt_env[0] == '1';
+    unsigned long long* wt_dev = nullptr;
+    if (wt_dump) {
+        CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&wt_dev), g_epw));
+        CUDA_CHECK(cudaMemsetAsync(wt_dev, 0, sizeof(g_epw), stream));
+    }
+#endif
     SWITCH_RDMA_RANKS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
+#ifdef NIXL_EP_WARP_TIMING
+    if (wt_dump) {
+        static unsigned long long h[64 * 32 * 8];
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMemcpy(h, wt_dev, sizeof(h), cudaMemcpyDeviceToHost));
+        // per role: warps, sum lifetime, sum buckets
+        double life[5] = {}, b[5][4] = {}, mx[5] = {};
+        int n[5] = {};
+        for (int w = 0; w < 64 * 32; ++w) {
+            const auto* p = h + w * 8;
+            if (p[7] == 0) continue;
+            const int r = static_cast<int>(p[7]) - 1;
+            n[r]++, life[r] += p[0], mx[r] = std::max(mx[r], static_cast<double>(p[0]));
+            for (int i = 0; i < 4; ++i) b[r][i] += p[1 + i];
+        }
+        static const char* names[5] = {"RDMASender", "RDMASenderCoord", "Forwarder", "ForwarderCoord", "NVLReceiver"};
+        for (int r = 0; r < 5; ++r)
+            if (n[r])
+                printf("[EPW rank %d sms %d] %-16s warps %3d avg_life %8.1f us max %8.1f us | b0 %5.1f%% b1 %5.1f%% b2 %5.1f%% b3 %5.1f%%\n",
+                       rank, num_channels * 2, names[r], n[r], life[r] / n[r] / 1965.0, mx[r] / 1965.0,
+                       100 * b[r][0] / life[r], 100 * b[r][1] / life[r], 100 * b[r][2] / life[r], 100 * b[r][3] / life[r]);
+        fflush(stdout);
+    }
+#endif
 }
 
 template <int kNumTMABytesPerWarp>
