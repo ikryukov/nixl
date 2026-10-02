@@ -1510,6 +1510,7 @@ static std::optional<std::vector<nixl_blob_t>> convert_mds(const std::optional<s
 } // namespace nixl_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.attr("NUM_MAX_NVL_PEERS") = NUM_MAX_NVL_PEERS;
     m.doc() = "NIXL_EP: an efficient expert-parallel communication library";
     m.def("get_low_latency_buffer_size_hint", &nixl_ep::get_low_latency_buffer_size_hint);
 

@@ -22,7 +22,11 @@
 
 #pragma once
 
+// NVLink group size (ranks sharing an NVL domain). Build-time: -Dnixl_ep_nvl_peers=4 for one GB200 node.
+#ifndef NUM_MAX_NVL_PEERS
 #define NUM_MAX_NVL_PEERS 8
+#endif
+static_assert(NUM_MAX_NVL_PEERS == 4 or NUM_MAX_NVL_PEERS == 8, "NUM_MAX_NVL_PEERS must be 4 or 8");
 #define NUM_MAX_RDMA_PEERS 20
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024

@@ -65,7 +65,7 @@ def test_main(
         args.num_experts,
     )
 
-    assert num_experts % num_ranks == 0 and num_local_ranks == 8
+    assert num_experts % num_ranks == 0 and num_local_ranks == nixl_ep.NUM_MAX_NVL_PEERS
     if local_rank == 0:
         print(
             f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}",
@@ -446,7 +446,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # so that UCX/DOCA can see all GPUs for GPU-initiated RDMA when needed.
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
-    torch.cuda.set_device(local_rank % 8)
+    torch.cuda.set_device(local_rank % nixl_ep.NUM_MAX_NVL_PEERS)
 
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
 
@@ -490,7 +490,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     buffer.connect_ranks([i for i in range(num_ranks) if i != rank])
 
-    assert num_local_ranks == 8 and num_ranks > 8
+    assert num_local_ranks == nixl_ep.NUM_MAX_NVL_PEERS and num_ranks > num_local_ranks
     torch.manual_seed(rank)
 
     for i in (num_sms,):

@@ -113,6 +113,10 @@ nixl_ep_cuda_args = [
     '-Xcompiler', '-Wno-attributes',
 ]
 
+nvl_peers = get_option('nixl_ep_nvl_peers').to_string()
+nixl_ep_cpp_args += ['-DNUM_MAX_NVL_PEERS=' + nvl_peers]
+nixl_ep_cuda_args += ['-DNUM_MAX_NVL_PEERS=' + nvl_peers]
+
 topk_idx_bits = meson.get_external_property('topk_idx_bits', '32')
 nixl_ep_cpp_args += ['-DTOPK_IDX_BITS=' + topk_idx_bits]
 nixl_ep_cuda_args += ['-DTOPK_IDX_BITS=' + topk_idx_bits]

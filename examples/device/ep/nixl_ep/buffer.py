@@ -93,8 +93,11 @@ class Buffer:
         self.tcp_store_group = tcp_store_group
         assert not (group and comm)
 
-        if disable_ll_nvlink:
-            os.environ["UCX_TLS"] = "^cuda_ipc"
+        if disable_ll_nvlink or not low_latency_mode:
+            # HT reaches its RDMA peers only through the NIC (NVL peers use IPC buffers). Without this UCX
+            # picks cuda_ipc for RDMA peers inside the same multi-node NVLink domain, turning every
+            # nixlPut into a single-warp NVLink copy (~1.4 GB/s per channel on GB200 NVL72).
+            os.environ.setdefault("UCX_TLS", "^cuda_ipc")
 
         self.runtime = nixl_ep_cpp.Buffer(
             self.rank, explicitly_destroy, low_latency_mode, timeout_ms

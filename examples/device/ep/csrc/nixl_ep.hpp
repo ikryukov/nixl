@@ -90,7 +90,6 @@ struct NixlMemoryViews {
 };
 
 struct Buffer {
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
 
 private:
     int buffer_idx = 0; // Double buffering index

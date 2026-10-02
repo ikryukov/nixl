@@ -62,5 +62,6 @@ from .utils import EventOverlap  # noqa: E402
 
 topk_idx_t = getattr(_nixl_ep_cpp, "topk_idx_t", torch.int64)
 Config = _nixl_ep_cpp.Config
+NUM_MAX_NVL_PEERS = getattr(_nixl_ep_cpp, "NUM_MAX_NVL_PEERS", 8)
 
-__all__ = ["Buffer", "EventOverlap", "Config"]
+__all__ = ["Buffer", "EventOverlap", "Config", "NUM_MAX_NVL_PEERS"]
