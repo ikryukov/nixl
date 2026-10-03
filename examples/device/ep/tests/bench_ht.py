@@ -96,6 +96,9 @@ if a.sanity:
                 log(f"[sanity] {mode} iter {i} ok")
         torch.cuda.synchronize(); dist.barrier()
         log(f"[sanity] {mode} {a.sanity} iters ok in {time.time()-t0:.1f}s")
+    buf.destroy()
+    dist.barrier()
+    dist.destroy_process_group()
     sys.exit(0)
 
 for sms in (int(s) for s in a.sms.split(",")):

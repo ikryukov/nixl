@@ -165,6 +165,7 @@ struct DpaPeer {
 
 struct DpaState {
     decltype(&epdpa_core_create) core_create;
+    decltype(&epdpa_core_destroy) core_destroy;
     decltype(&epdpa_reg) reg;
     decltype(&epdpa_reg_cached) reg_cached;
     decltype(&epdpa_window) window;
@@ -322,6 +323,19 @@ static void dpa_disconnect_peers(DpaState* d, const std::vector<int>& rdma_peers
     dpa_clear_streams(d);
 }
 
+// Buffer::destroy: releases the DPA side before the memory it points at goes away. Local only: a rank that leaves
+// while the others stay disconnects from them first (disconnect_ranks).
+static void dpa_destroy(DpaState* d) {
+    d->quiesce(d->core);
+    for (auto*& p : d->conn) {
+        d->peer_destroy(p);
+        p = nullptr;
+    }
+    dpa_clear_streams(d);
+    d->core_destroy(d->core);
+    delete d;
+}
+
 // Remote rdma ranks among the given global ranks that are DPA peers of this rank (same nvl rank).
 static std::vector<int> dpa_rdma_peers(const DpaState* d, const std::vector<int>& ranks) {
     std::vector<int> out;
@@ -371,6 +385,7 @@ void Buffer::dpa_init(const pybind11::function& kv_set, const pybind11::function
     auto* d = new DpaState();
 #define DPA_SYM(field, name) EP_HOST_ASSERT((d->field = reinterpret_cast<decltype(d->field)>(dlsym(h, #name))) != nullptr)
     DPA_SYM(core_create, epdpa_core_create);
+    DPA_SYM(core_destroy, epdpa_core_destroy);
     DPA_SYM(reg, epdpa_reg);
     DPA_SYM(reg_cached, epdpa_reg_cached);
     DPA_SYM(window, epdpa_window);
@@ -562,6 +577,7 @@ size_t dpa_scratch_offset(int64_t num_rdma_bytes) { return static_cast<size_t>(n
 size_t dpa_scratch_size(int) { return 0; }
 struct DpaState {};
 static bool dpa_fused(const void*) { return false; }
+static void dpa_destroy(DpaState*) {}
 void Buffer::dpa_connect_ranks(const std::vector<int>&) {}
 void Buffer::dpa_disconnect_ranks(const std::vector<int>&) {}
 void Buffer::dpa_init(const pybind11::function&, const pybind11::function&, const pybind11::function&) {
@@ -765,6 +781,11 @@ void Buffer::destroy() {
 
     // Synchronize
     warn_cuda(cudaDeviceSynchronize(), "synchronize device");
+
+    if (dpa_state) {
+        dpa_destroy(static_cast<DpaState*>(dpa_state));
+        dpa_state = nullptr;
+    }
 
     _nixl_ep_destroy();
 
