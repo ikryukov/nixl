@@ -175,9 +175,13 @@ struct DpaState {
     decltype(&epdpa_streams) streams;
     decltype(&epdpa_streams_free) streams_free;
     decltype(&epdpa_launch) launch;
-    decltype(&epdpa_allgather) allgather;
     epdpa_core* core = nullptr;
-    pybind11::function ag; // Python all_gather_object over the EP group (kept for (re)connects)
+    // TCP store of the EP group (set / get with timeout / delete) for the pairwise QP exchange, keys per ordered pair
+    // and generation
+    pybind11::function kv_set, kv_get, kv_del;
+    std::vector<int> gen; // [remote rdma rank]: (re)connects of the pair so far, advanced identically on both sides
+    int connect_timeout_s = 300, peer_timeout_s = 30;
+    int reconnect_peer = -1; // NIXL_EP_DPA_RECONNECT_PEER=r: the test reconnect only touches the pairs with rdma rank r
     int rank = 0, rdma_rank = 0, nvl_rank = 0, num_rdma_ranks = 0;
     uint8_t* base = nullptr; // rdma buffer, scratch at scratch_off
     size_t scratch_off = 0;
@@ -203,23 +207,43 @@ struct DpaState {
     uint64_t dispatches = 0;
     int reconnects = 0;
     double disconnect_ms = 0, connect_ms = 0, last_disconnect_ms = 0;
+    int last_reconnect_peers = 0;
 };
 
 static bool dpa_fused(const void* state) {
     return state != nullptr and static_cast<const DpaState*>(state)->fused;
 }
 
-static int dpa_allgather_cb(void* user, void* buf, size_t elem) {
-    auto* d = static_cast<DpaState*>(user);
+// The glue exchanges pairwise through the TCP store; the engine's allgather (epdpa_connect) is not used.
+static int dpa_no_allgather(void*, void*, size_t) {
+    return -1;
+}
+
+// ponytail: keys are unique per pair and generation only; a re-created Buffer or a replaced rank restarts at
+// generation 0 and would read stale keys. Add an epoch (e.g. a store.add() counter) to the prefix when that has to work.
+static std::string dpa_key(const char* kind, int gen, int from, int to) {
+    return std::string(kind) + "/" + std::to_string(gen) + "/" + std::to_string(from) + "->" + std::to_string(to);
+}
+
+static void dpa_kv_set(DpaState* d, const std::string& key, const void* value, size_t size) {
     pybind11::gil_scoped_acquire gil;
-    auto* b = static_cast<char*>(buf);
-    auto all = d->ag(pybind11::bytes(b + size_t(d->rank) * elem, elem)).cast<pybind11::list>();
-    for (size_t i = 0; i < all.size(); ++i) {
-        const std::string s = all[i].cast<std::string>();
-        EP_HOST_ASSERT(s.size() == elem);
-        std::memcpy(b + i * elem, s.data(), elem);
-    }
-    return 0;
+    d->kv_set(key, pybind11::bytes(static_cast<const char*>(value), size));
+}
+
+static bool dpa_kv_get(DpaState* d, const std::string& key, void* value, size_t size, int timeout_s) {
+    pybind11::gil_scoped_acquire gil;
+    pybind11::object r = d->kv_get(key, timeout_s);
+    if (r.is_none())
+        return false;
+    const std::string v = r.cast<std::string>();
+    EP_HOST_ASSERT(v.size() == size);
+    std::memcpy(value, v.data(), size);
+    return true;
+}
+
+static void dpa_kv_del(DpaState* d, const std::string& key) {
+    pybind11::gil_scoped_acquire gil;
+    d->kv_del(key);
 }
 
 static void dpa_clear_streams(DpaState* d) {
@@ -234,34 +258,62 @@ struct DpaConnMsg {
     DpaPeer peer;
 };
 
-// Collective: connects to the given remote rdma ranks (peer = r * NVL + nvl_rank), one QP per channel (tag).
+// Pairwise: for every listed remote rdma rank r (peer p = r * NVL + nvl_rank) create the QPs (one per channel = tag),
+// publish "epdpa/<gen>/<me>-><p>", wait for "epdpa/<gen>/<p>-><me>" and connect; then publish "epdpa_r/<gen>/<me>-><p>"
+// and wait for the peer's. Each (re)connect of the pair advances its generation on both sides, so a reconnect never
+// reads a stale key.
 static void dpa_connect_peers(DpaState* d, const std::vector<int>& rdma_peers) {
-    const int R = d->num_rdma_ranks;
-    std::vector<DpaConnMsg> all(size_t(R) * NUM_MAX_NVL_PEERS * R); // [rank][remote rdma rank]
-    DpaConnMsg* mine = all.data() + size_t(d->rank) * R;
-    for (int r : rdma_peers) {
+    auto wait = [d](const std::string& key, int p, void* value, size_t size) {
+        if (not dpa_kv_get(d, key, value, size, d->connect_timeout_s))
+            throw std::runtime_error("NIXL_EP_DPA: rank " + std::to_string(p) + " did not publish " + key + " within " +
+                                     std::to_string(d->connect_timeout_s) + " s");
+    };
+    std::vector<DpaConnMsg> mine(rdma_peers.size());
+    for (size_t i = 0; i < rdma_peers.size(); ++i) {
+        const int r = rdma_peers[i], p = r * NUM_MAX_NVL_PEERS + d->nvl_rank;
         EP_HOST_ASSERT(r != d->rdma_rank and d->conn[r] == nullptr);
-        EP_HOST_ASSERT(d->peer_create(d->core, kDpaChannels, d->sq_depth, EPDPA_SIG_SLOTS, &d->conn[r], &mine[r].info) == 0);
-        mine[r].peer = d->me;
+        EP_HOST_ASSERT(
+            d->peer_create(d->core, kDpaChannels, d->sq_depth, EPDPA_SIG_SLOTS, &d->conn[r], &mine[i].info) == 0);
+        mine[i].peer = d->me;
+        dpa_kv_set(d, dpa_key("epdpa", ++d->gen[r], d->rank, p), &mine[i], sizeof(DpaConnMsg));
     }
-    EP_HOST_ASSERT(dpa_allgather_cb(d, all.data(), sizeof(DpaConnMsg) * R) == 0);
     for (int r : rdma_peers) {
-        const int p = r * NUM_MAX_NVL_PEERS + d->nvl_rank;
-        const DpaConnMsg& m = all[size_t(p) * R + d->rdma_rank];
+        const int p = r * NUM_MAX_NVL_PEERS + d->nvl_rank, g = d->gen[r];
+        DpaConnMsg m{};
+        wait(dpa_key("epdpa", g, p, d->rank), p, &m, sizeof(m));
+        if (g > 1) // the peer publishes generation g after it is done with all keys of generation g - 1 of this rank
+            for (const char* kind : {"epdpa", "epdpa_q", "epdpa_r"})
+                dpa_kv_del(d, dpa_key(kind, g - 1, d->rank, p));
         d->peers[p] = m.peer;
         d->qp[r].resize(kDpaChannels);
         d->comp[r].resize(kDpaChannels);
         EP_HOST_ASSERT(d->peer_connect(d->conn[r], &m.info, d->qp[r].data(), d->comp[r].data()) == 0);
+        const char ready = 1;
+        dpa_kv_set(d, dpa_key("epdpa_r", g, d->rank, p), &ready, 1);
+    }
+    // Nothing is posted before the peer's QPs are connected as well: a WRITE that reaches a QP before it is RTR is
+    // dropped and only resent after the ACK timeout (without this wait a one-peer reconnect cost ~110 ms more)
+    for (int r : rdma_peers) {
+        const int p = r * NUM_MAX_NVL_PEERS + d->nvl_rank;
+        char ready = 0;
+        wait(dpa_key("epdpa_r", d->gen[r], p, d->rank), p, &ready, 1);
     }
     dpa_clear_streams(d);
 }
 
-// Collective: drops the connections to the given remote rdma ranks once no WQE is in flight on either side.
+// Pairwise: once this rank's DPA side is idle, publish "epdpa_q/<gen>/<me>-><p>", wait for the peer's (dropping the QPs
+// anyway when it does not show up in time) and destroy the QPs.
 static void dpa_disconnect_peers(DpaState* d, const std::vector<int>& rdma_peers) {
     EP_HOST_ASSERT(d->quiesce(d->core) == 0);
-    std::vector<char> barrier(size_t(d->num_rdma_ranks) * NUM_MAX_NVL_PEERS); // peers have quiesced as well
-    EP_HOST_ASSERT(dpa_allgather_cb(d, barrier.data(), 1) == 0);
+    const char quiesced = 1;
+    for (int r : rdma_peers)
+        dpa_kv_set(d, dpa_key("epdpa_q", d->gen[r], d->rank, r * NUM_MAX_NVL_PEERS + d->nvl_rank), &quiesced, 1);
     for (int r : rdma_peers) {
+        const int p = r * NUM_MAX_NVL_PEERS + d->nvl_rank;
+        char c = 0;
+        if (not dpa_kv_get(d, dpa_key("epdpa_q", d->gen[r], p, d->rank), &c, 1, d->peer_timeout_s))
+            fprintf(stderr, "[nixl_ep] rank %d: DPA peer %d did not quiesce within %d s, dropping its QPs anyway\n",
+                    d->rank, p, d->peer_timeout_s);
         d->peer_destroy(d->conn[r]);
         d->conn[r] = nullptr;
         d->qp[r].clear();
@@ -309,7 +361,8 @@ void Buffer::dpa_disconnect_ranks(const std::vector<int>& ranks) {
     dpa_disconnect_peers(d, peers);
 }
 
-void Buffer::dpa_init(const pybind11::function& all_gather_object) {
+void Buffer::dpa_init(const pybind11::function& kv_set, const pybind11::function& kv_get,
+                      const pybind11::function& kv_del) {
     EP_HOST_ASSERT(not low_latency_mode and dpa_scratch_bytes > 0 and dpa_state == nullptr);
     const char* lib = std::getenv("NIXL_EP_DPA_LIB") ? std::getenv("NIXL_EP_DPA_LIB") : "libepdpa.so";
     void* h = dlopen(lib, RTLD_NOW | RTLD_GLOBAL);
@@ -328,9 +381,12 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
     DPA_SYM(streams, epdpa_streams);
     DPA_SYM(streams_free, epdpa_streams_free);
     DPA_SYM(launch, epdpa_launch);
-    DPA_SYM(allgather, epdpa_allgather);
 #undef DPA_SYM
-    d->ag = all_gather_object;
+    d->kv_set = kv_set, d->kv_get = kv_get, d->kv_del = kv_del;
+    d->connect_timeout_s = dpa_env("NIXL_EP_DPA_CONNECT_TIMEOUT", 300);
+    d->peer_timeout_s = dpa_env("NIXL_EP_DPA_PEER_TIMEOUT", 30);
+    d->reconnect_peer = dpa_env("NIXL_EP_DPA_RECONNECT_PEER", -1);
+    EP_HOST_ASSERT(d->reconnect_peer < num_rdma_ranks);
     d->rank = rank, d->rdma_rank = rdma_rank, d->nvl_rank = nvl_rank, d->num_rdma_ranks = num_rdma_ranks;
     d->reconnect_every = dpa_env("NIXL_EP_DPA_RECONNECT_EVERY", 0);
     d->fused = dpa_env("NIXL_EP_DPA_FUSED", 0) == 1;
@@ -345,7 +401,8 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
     d->scratch_off = dpa_scratch_offset(num_rdma_bytes);
     d->layout = DpaScratch(num_rdma_ranks);
     const size_t total = d->scratch_off + dpa_scratch_bytes;
-    EP_HOST_ASSERT(d->core_create(&d->core, rank, num_rdma_ranks * NUM_MAX_NVL_PEERS, device_id, dpa_allgather_cb, d) == 0);
+    EP_HOST_ASSERT(
+        d->core_create(&d->core, rank, num_rdma_ranks * NUM_MAX_NVL_PEERS, device_id, dpa_no_allgather, nullptr) == 0);
     d->mr = d->reg(d->core, d->base, total, 1);
     d->sig_mr = d->reg(d->core, d->base, total, 0); // tail signals must land after the data: no relaxed ordering
     EP_HOST_ASSERT(d->mr and d->sig_mr and d->window(d->core, d->base, total, &d->mm) == 0);
@@ -354,6 +411,7 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
     d->peers.resize(num_rdma_ranks * NUM_MAX_NVL_PEERS);
     d->peers[rank] = d->me;
     d->conn.assign(num_rdma_ranks, nullptr);
+    d->gen.assign(num_rdma_ranks, 0);
     d->qp.resize(num_rdma_ranks);
     d->comp.resize(num_rdma_ranks);
     // Outstanding WQEs per QP: up to `inflight` signals, each after at most sig_max data WQEs
@@ -403,7 +461,10 @@ static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx
     if (d->reconnect_every > 0 and d->dispatches > 0 and d->dispatches % d->reconnect_every == 0) {
         using clk = std::chrono::steady_clock;
         const auto t0 = clk::now();
-        const auto peers = dpa_all_rdma_peers(d);
+        auto peers = dpa_all_rdma_peers(d);
+        if (d->reconnect_peer >= 0 and d->reconnect_peer != d->rdma_rank) // only the pair with that rdma rank
+            peers = d->conn[d->reconnect_peer] ? std::vector<int>{d->reconnect_peer} : std::vector<int>{};
+        d->last_reconnect_peers = static_cast<int>(peers.size());
         dpa_disconnect_peers(d, peers);
         const auto t1 = clk::now();
         dpa_connect_peers(d, peers);
@@ -486,7 +547,7 @@ static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx
         d->connect_ms += now - reconnect_t0;
         if (d->rank == 0 and (d->reconnects <= 2 or d->reconnects % 50 == 0))
             printf("[nixl_ep] DPA reconnect #%d (%d peers x %d QPs): disconnect %.2f ms, connect + streams %.2f ms (avg "
-                   "%.2f / %.2f ms)\n", d->reconnects, static_cast<int>(dpa_all_rdma_peers(d).size()), kDpaChannels,
+                   "%.2f / %.2f ms)\n", d->reconnects, d->last_reconnect_peers, kDpaChannels,
                    d->last_disconnect_ms, now - reconnect_t0, d->disconnect_ms / d->reconnects,
                    d->connect_ms / d->reconnects);
     }
@@ -503,7 +564,7 @@ struct DpaState {};
 static bool dpa_fused(const void*) { return false; }
 void Buffer::dpa_connect_ranks(const std::vector<int>&) {}
 void Buffer::dpa_disconnect_ranks(const std::vector<int>&) {}
-void Buffer::dpa_init(const pybind11::function&) {
+void Buffer::dpa_init(const pybind11::function&, const pybind11::function&, const pybind11::function&) {
     throw std::runtime_error("NIXL_EP_DPA=1 needs nixl_ep built with -Dnixl_ep_dpa_inc=<libepdpa include dir>");
 }
 static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState*, nixl_ep::gpu_nixl_ctx ctx, int, int, int, int, int, int, int, int,

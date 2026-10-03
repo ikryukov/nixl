@@ -199,8 +199,9 @@ private:
 public:
     Buffer(int rank, bool explicitly_destroy, bool low_latency_mode, int timeout_ms);
 
-    void dpa_init(const pybind11::function& all_gather_object);
-    // DPA peer connections follow connect_ranks / disconnect_ranks (collective over the EP group)
+    // DPA offload: kv_set(key, bytes), kv_get(key, timeout_s) -> bytes | None, kv_del(key) over the EP group TCP store
+    void dpa_init(const pybind11::function& kv_set, const pybind11::function& kv_get, const pybind11::function& kv_del);
+    // DPA peer connections follow connect_ranks / disconnect_ranks (pairwise with the listed ranks)
     void dpa_connect_ranks(const std::vector<int>& ranks);
     void dpa_disconnect_ranks(const std::vector<int>& ranks);
 

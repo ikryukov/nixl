@@ -842,9 +842,21 @@ class Buffer:
         else:
             self.runtime.connect_ranks(remote_ranks, None, ipc_handles)
 
-        # DPA offload of the dispatch RDMA leg (NIXL_EP_DPA=1, NIXL_EP_DPA_LIB=<libepdpa.so>)
+        # DPA offload of the dispatch RDMA leg (NIXL_EP_DPA=1, NIXL_EP_DPA_LIB=<libepdpa.so>): the DPA QPs are exchanged
+        # pairwise through the TCP store, so peers can be (re)connected independently
         if os.getenv("NIXL_EP_DPA", "0") == "1":
-            self.runtime.dpa_init(all_gather_object)
+            store = self.tcp_store_group
+            if store is None:
+                store = dist.distributed_c10d._get_default_store()
+
+            def kv_get(key: str, timeout_s: int):
+                try:
+                    store.wait([key], timedelta(seconds=timeout_s))
+                except Exception:
+                    return None
+                return store.get(key)
+
+            self.runtime.dpa_init(store.set, kv_get, store.delete_key)
 
     def connect_ranks(self, remote_ranks: List[int], activate: bool = True) -> None:
         """
