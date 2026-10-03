@@ -589,9 +589,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     // RDMA sender warp synchronization
     // NOTES: `rdma_send_channel_tail` means the latest released tail
     // NOTES: `rdma_send_channel_window` means the ongoing 32 transactions' status
-    // DPA mode: tokens of each dpa_block block of the channel packed so far by the sender warps. The DPA
-    // signals the tail once per block and receivers return credit in chunked_send steps, so a block must fit in
-    // the ring with chunked_send to spare (host asserts block + chunked_send <= ring).
+    // DPA mode: tokens of each dpa_block block of the channel packed so far by the sender warps.
     constexpr int kDpaMaxBlocks = 128;
     const int dpa_block = nixl_ctx.dpa.block_tokens;
     __shared__ int dpa_block_done[kDpaMaxBlocks];

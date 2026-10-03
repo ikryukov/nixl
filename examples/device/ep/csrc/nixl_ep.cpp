@@ -116,7 +116,7 @@ int Buffer::get_rank_bound(std::optional<int> num_experts) const {
 #ifdef NIXL_EP_DPA
 // One DPA stream per (channel, remote rdma rank) gathers x | scales | SourceMeta | topk of every token the
 // dispatch kernel publishes in the stream's mailbox straight into the peer's ring slot, waits for ring credit
-// on head.buffer(dst) and adds each block's token count to the peer's tail.buffer(my rdma rank) (atomic fetch-add).
+// on head.buffer(dst) and adds the tokens posted so far to the peer's tail.buffer(my rdma rank) (atomic fetch-add).
 static constexpr int kDpaChannels = 16, kDpaMaxBlocks = 128, kDpaMaxBlockTokens = 128, kDpaMaxInflight = 8;
 static constexpr int kDpaMaxTopK = 128, kDpaMaxScales = 128;
 static constexpr size_t kDpaAlign = 1 << 16;
@@ -173,7 +173,7 @@ struct DpaState {
     std::vector<DpaPeer> peers;
     std::vector<doca_dpa_dev_verbs_qp_t> qp; // [channel][remote rdma index]
     std::vector<doca_dpa_dev_completion_t> comp;
-    std::map<std::tuple<int, int, int, int>, std::pair<uint64_t, int>> launch_streams; // (channels, bpt, ring, block)
+    std::map<std::tuple<int, int, int, int>, std::pair<uint64_t, int>> launch_streams; // (channels, bpt, ring, block|sig)
     uint64_t round = 0;
 };
 
@@ -254,14 +254,18 @@ static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx
                                           int num_channels, int hidden_bytes, int num_scales, int num_topk,
                                           int ring, int chunked_send, int num_tokens, const void* x,
                                           const torch::Tensor& x_tensor) {
-    // Block size: NIXL_EP_DPA_BLOCK, else the largest of 128/64 that fits in the ring with chunked_send to spare.
+    // Block size (NIXL_EP_DPA_BLOCK, default 64) and tail signal granularity (NIXL_EP_DPA_SIG_EVERY, default
+    // chunked_send, the receivers' credit step). The engine flushes the pending tail before waiting for ring
+    // credit, so block and ring are independent.
     const char* bs = std::getenv("NIXL_EP_DPA_BLOCK");
-    const int block = bs ? std::atoi(bs) : (kDpaMaxBlockTokens + chunked_send <= ring ? kDpaMaxBlockTokens : 64);
+    const char* se = std::getenv("NIXL_EP_DPA_SIG_EVERY");
+    const int block = bs ? std::atoi(bs) : 64;
+    const int sig_every = se ? std::atoi(se) : chunked_send;
     EP_HOST_ASSERT(num_channels <= kDpaChannels and num_topk <= kDpaMaxTopK and num_scales <= kDpaMaxScales and
                    num_tokens <= ctx.dpa.max_tokens and block % 32 == 0 and block <= kDpaMaxBlockTokens and
-                   block + chunked_send <= ring);
+                   sig_every >= 0);
     const int bpt = (hidden_bytes + num_scales * 4 + 8 + num_topk * 8 + 15) / 16 * 16; // ht::get_num_bytes_per_token
-    const auto key = std::make_tuple(num_channels, bpt, ring, block);
+    const auto key = std::make_tuple(num_channels, bpt, ring, block * 1024 + sig_every);
     auto it = d->launch_streams.find(key);
     if (it == d->launch_streams.end()) {
         // RDMA buffer layout of the dispatch kernel (SymBuffer chain): data, meta, head, tail
@@ -291,7 +295,7 @@ static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx
                 s.credit = reinterpret_cast<uint64_t>(d->base) + head_off + 8 * (R * ch + r);
                 s.sig_src = scratch + L.sig + uint64_t(qi) * EPDPA_SIG_SLOTS * 8;
                 s.sig_dst = p.base + tail_off + 8 * (R * ch + rdma_rank);
-                s.sig_mode = EPDPA_SIG_TAIL, s.tok_from_mbox = 1;
+                s.sig_mode = EPDPA_SIG_TAIL, s.tok_from_mbox = 1, s.sig_every = static_cast<uint32_t>(sig_every);
                 st.push_back(s);
             }
         uint64_t h = 0;
