@@ -119,17 +119,23 @@ int Buffer::get_rank_bound(std::optional<int> num_experts) const {
 // on head.buffer(dst) and adds the tokens posted so far to the peer's tail.buffer(my rdma rank) (atomic fetch-add).
 // One QP tag per channel: up to 32 channels when the engine has as many tags.
 static constexpr int kDpaChannels = EPDPA_MAX_TAGS < 32 ? EPDPA_MAX_TAGS : 32;
-static constexpr int kDpaMaxBlocks = 128, kDpaMaxBlockTokens = 128, kDpaMaxInflight = 8;
+static constexpr int kDpaMaxBlocks = 128, kDpaMaxBlockTokens = 128;
 static constexpr int kDpaMaxTopK = 128, kDpaMaxScales = 128;
+static constexpr int kDpaMaxRecBytes = kDpaMaxScales * 4 + 8 + kDpaMaxTopK * 8;
+static constexpr int kDpaMaxStageBytes = 16384; // per token, NIXL_EP_DPA_X_STAGE=1 (diagnostic)
 static constexpr size_t kDpaAlign = 1 << 16;
 
+static int dpa_env(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    return v ? std::atoi(v) : dflt;
+}
+
 static int dpa_max_tokens() {
-    const char* v = std::getenv("NIXL_EP_DPA_MAX_TOKENS");
-    return v ? std::atoi(v) : 16384;
+    return dpa_env("NIXL_EP_DPA_MAX_TOKENS", 16384);
 }
 
 struct DpaScratch {
-    size_t mbox, sig, meta, topk, scales, end;
+    size_t mbox, sig, meta, topk, scales, rec, stage, end;
     explicit DpaScratch(int num_rdma_ranks) {
         auto up = [](size_t v) { return (v + kDpaAlign - 1) / kDpaAlign * kDpaAlign; };
         const size_t t = dpa_max_tokens();
@@ -138,7 +144,9 @@ struct DpaScratch {
         meta = up(sig + size_t(kDpaChannels) * num_rdma_ranks * EPDPA_SIG_SLOTS * 8);
         topk = up(meta + size_t(num_rdma_ranks) * t * 8);
         scales = up(topk + t * 2 * kDpaMaxTopK * 4);
-        end = up(scales + t * kDpaMaxScales * 4);
+        rec = up(scales + t * kDpaMaxScales * 4);
+        stage = up(rec + size_t(num_rdma_ranks) * t * kDpaMaxRecBytes);
+        end = up(stage + (dpa_env("NIXL_EP_DPA_X_STAGE", 0) ? t * kDpaMaxStageBytes : 0));
     }
 };
 
@@ -178,6 +186,11 @@ struct DpaState {
     std::map<std::tuple<int, int, int, int>, std::pair<uint64_t, int>> launch_streams; // (channels, bpt, ring, block|sig)
     uint64_t round = 0;
     bool fused = false; // NIXL_EP_DPA_FUSED=1: one block per channel (see the dispatch kernel)
+    int sge = 2;         // NIXL_EP_DPA_SGE: 2 = x + packed [scales | meta | topk], 4 = x, scales, meta, topk
+    int inflight = 16;   // NIXL_EP_DPA_INFLIGHT: tail signals in flight per stream (<= EPDPA_SIG_SLOTS)
+    int sig_max = 16;    // largest signal step the send queues are sized for (NIXL_EP_DPA_SIG_EVERY, else 16)
+    int fence_token = 0; // NIXL_EP_DPA_FENCE=token: system fence per token instead of per (warp, block)
+    bool x_stage = false; // NIXL_EP_DPA_X_STAGE=1: copy x into the RDMA MR before the kernel (diagnostic)
 };
 
 static bool dpa_fused(const void* state) {
@@ -216,7 +229,14 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
 #undef DPA_SYM
     d->ag = &all_gather_object;
     d->rank = rank;
-    d->fused = std::getenv("NIXL_EP_DPA_FUSED") and std::string(std::getenv("NIXL_EP_DPA_FUSED")) == "1";
+    d->fused = dpa_env("NIXL_EP_DPA_FUSED", 0) == 1;
+    d->sge = dpa_env("NIXL_EP_DPA_SGE", 2);
+    d->inflight = dpa_env("NIXL_EP_DPA_INFLIGHT", EPDPA_SIG_SLOTS);
+    d->sig_max = dpa_env("NIXL_EP_DPA_SIG_EVERY", 16);
+    d->fence_token = std::getenv("NIXL_EP_DPA_FENCE") and std::string(std::getenv("NIXL_EP_DPA_FENCE")) == "token";
+    d->x_stage = dpa_env("NIXL_EP_DPA_X_STAGE", 0) == 1;
+    EP_HOST_ASSERT((d->sge == 2 or d->sge == 4) and d->inflight >= 1 and d->inflight <= EPDPA_SIG_SLOTS and
+                   d->sig_max >= 1);
     d->base = static_cast<uint8_t*>(rdma_buffer_ptr);
     d->scratch_off = dpa_scratch_offset(num_rdma_bytes);
     d->layout = DpaScratch(num_rdma_ranks);
@@ -240,13 +260,16 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
     const int n = static_cast<int>(peer.size());
     d->qp.resize(n);
     d->comp.resize(n);
-    EP_HOST_ASSERT(d->connect(d->core, n, peer.data(), tag.data(), (kDpaMaxBlockTokens + 1) * kDpaMaxInflight + 16,
-                              kDpaMaxInflight, d->qp.data(), d->comp.data()) == 0);
+    // Outstanding WQEs per QP: up to `inflight` signals, each after at most sig_max data WQEs
+    EP_HOST_ASSERT(d->connect(d->core, n, peer.data(), tag.data(), (d->sig_max + 1) * EPDPA_SIG_SLOTS + 16,
+                              EPDPA_SIG_SLOTS, d->qp.data(), d->comp.data()) == 0);
     d->ag = nullptr;
     dpa_state = d;
     if (rank == 0)
-        printf("[nixl_ep] DPA offload of the HT dispatch RDMA leg: %d QPs, scratch %.1f MB%s\n", n,
-               dpa_scratch_bytes / 1e6, d->fused ? ", fused (1 SM per channel)" : "");
+        printf("[nixl_ep] DPA offload of the HT dispatch RDMA leg: %d QPs, scratch %.1f MB, %d SGE, %d signals in "
+               "flight, fence per %s%s%s\n", n, dpa_scratch_bytes / 1e6, d->sge, d->inflight,
+               d->fence_token ? "token" : "block", d->x_stage ? ", x staged" : "",
+               d->fused ? ", fused (1 SM per channel)" : "");
 
     const auto& L = d->layout;
     uint8_t* s = d->base + d->scratch_off;
@@ -254,6 +277,8 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
     gpu_ctx.dpa.meta = reinterpret_cast<uint64_t*>(s + L.meta);
     gpu_ctx.dpa.topk = reinterpret_cast<int*>(s + L.topk);
     gpu_ctx.dpa.scales = reinterpret_cast<float*>(s + L.scales);
+    gpu_ctx.dpa.rec = s + L.rec;
+    gpu_ctx.dpa.fence_token = d->fence_token;
     gpu_ctx.dpa.max_tokens = dpa_max_tokens();
     CUDA_CHECK(cudaMemset(s, 0, L.sig)); // mailboxes start at round 0
 }
@@ -262,7 +287,7 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
 static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx, int rdma_rank, int num_rdma_ranks,
                                           int num_channels, int hidden_bytes, int num_scales, int num_topk,
                                           int ring, int chunked_send, int num_tokens, const void* x,
-                                          const torch::Tensor& x_tensor) {
+                                          const torch::Tensor& x_tensor, cudaStream_t stream) {
     // Block size (NIXL_EP_DPA_BLOCK, default 64) and tail signal granularity (NIXL_EP_DPA_SIG_EVERY, default
     // chunked_send, the receivers' credit step). The engine flushes the pending tail before waiting for ring
     // credit, so block and ring are independent.
@@ -272,8 +297,9 @@ static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx
     const int sig_every = se ? std::atoi(se) : chunked_send;
     EP_HOST_ASSERT(num_channels <= kDpaChannels and num_topk <= kDpaMaxTopK and num_scales <= kDpaMaxScales and
                    num_tokens <= ctx.dpa.max_tokens and block % 32 == 0 and block <= kDpaMaxBlockTokens and
-                   sig_every >= 0);
+                   sig_every >= 0 and std::min(sig_every ? sig_every : block, block) <= d->sig_max);
     const int bpt = (hidden_bytes + num_scales * 4 + 8 + num_topk * 8 + 15) / 16 * 16; // ht::get_num_bytes_per_token
+    const int rec_bytes = num_scales * 4 + 8 + num_topk * 8; // 2-SGE record: the tail of the token record
     const auto key = std::make_tuple(num_channels, bpt, ring, block * 1024 + sig_every);
     auto it = d->launch_streams.find(key);
     if (it == d->launch_streams.end()) {
@@ -295,12 +321,13 @@ static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx
                 s.sig_lkey = d->mr->lkey, s.rkey = p.rkey, s.sig_rkey = p.sig_rkey, s.nsge = 4;
                 for (int i = 0; i < EPDPA_MAX_SGE; ++i)
                     s.mul[i] = 1;
-                s.add[2] = static_cast<uint32_t>(r * ctx.dpa.max_tokens); // SourceMeta [dst][token]
+                // per-destination piece: 2-SGE records or SourceMeta, both [dst][token]
+                s.add[d->sge == 2 ? 1 : 2] = static_cast<uint32_t>(r * ctx.dpa.max_tokens);
                 s.mbox = scratch + L.mbox + (uint64_t(ch) * R + r) * kDpaMaxBlocks * 32;
                 s.block_tokens = block, s.first_block = 0, s.block_step = 1, s.nblocks = kDpaMaxBlocks;
                 s.dst_base = p.base + data_ch * (ch + num_channels) + int64_t(ring) * bpt * rdma_rank;
                 s.dst_stride = bpt;
-                s.ring = ring, s.max_inflight = kDpaMaxInflight;
+                s.ring = ring, s.max_inflight = d->inflight;
                 s.credit = reinterpret_cast<uint64_t>(d->base) + head_off + 8 * (R * ch + r);
                 s.sig_src = scratch + L.sig + uint64_t(qi) * EPDPA_SIG_SLOTS * 8;
                 s.sig_dst = p.base + tail_off + 8 * (R * ch + rdma_rank);
@@ -316,17 +343,31 @@ static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx
     const int tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
     struct epdpa_launch p{};
     p.round = ++d->round;
-    p.addr[0] = reinterpret_cast<uint64_t>(x), p.len[0] = hidden_bytes;
-    p.lkey[0] = d->reg_cached(d->core, x, x_tensor.numel() * x_tensor.element_size());
-    p.addr[1] = scratch + L.scales, p.len[1] = num_scales * 4, p.lkey[1] = d->mr->lkey;
-    p.addr[2] = scratch + L.meta, p.len[2] = 8, p.lkey[2] = d->mr->lkey;
-    p.addr[3] = scratch + L.topk, p.len[3] = num_topk * 8, p.lkey[3] = d->mr->lkey;
+    if (d->x_stage) {
+        EP_HOST_ASSERT(hidden_bytes <= kDpaMaxStageBytes);
+        CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(scratch + L.stage), x, size_t(num_tokens) * hidden_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+        p.addr[0] = scratch + L.stage, p.len[0] = hidden_bytes, p.lkey[0] = d->mr->lkey;
+    } else {
+        p.addr[0] = reinterpret_cast<uint64_t>(x), p.len[0] = hidden_bytes;
+        p.lkey[0] = d->reg_cached(d->core, x, x_tensor.numel() * x_tensor.element_size());
+    }
+    for (int i = 1; i < EPDPA_MAX_SGE; ++i)
+        p.lkey[i] = d->mr->lkey;
+    if (d->sge == 2) {
+        p.addr[1] = scratch + L.rec, p.len[1] = rec_bytes;
+    } else {
+        p.addr[1] = scratch + L.scales, p.len[1] = num_scales * 4;
+        p.addr[2] = scratch + L.meta, p.len[2] = 8;
+        p.addr[3] = scratch + L.topk, p.len[3] = num_topk * 8;
+    }
     p.nblocks = (tokens_per_channel + block - 1) / block;
     EP_HOST_ASSERT(p.lkey[0] != 0 and p.nblocks <= kDpaMaxBlocks);
     EP_HOST_ASSERT(d->launch(d->core, it->second.first, it->second.second, &p) == 0);
     ctx.dpa.round = p.round;
     ctx.dpa.max_blocks = static_cast<int>(p.nblocks);
     ctx.dpa.block_tokens = block;
+    ctx.dpa.rec_bytes = d->sge == 2 ? rec_bytes : 0;
     return ctx;
 }
 #else
@@ -338,7 +379,7 @@ void Buffer::dpa_init(const pybind11::function&) {
     throw std::runtime_error("NIXL_EP_DPA=1 needs nixl_ep built with -Dnixl_ep_dpa_inc=<libepdpa include dir>");
 }
 static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState*, nixl_ep::gpu_nixl_ctx ctx, int, int, int, int, int, int, int, int,
-                                          int, const void*, const torch::Tensor&) {
+                                          int, const void*, const torch::Tensor&, cudaStream_t) {
     return ctx;
 }
 #endif
@@ -1096,7 +1137,8 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                         dpa_state ? dpa_dispatch(static_cast<DpaState*>(dpa_state), gpu_ctx, rdma_rank, num_rdma_ranks,
                                                  num_channels, hidden_int4 * 16, num_scales, num_topk,
                                                  config.num_max_rdma_chunked_recv_tokens,
-                                                 config.num_max_rdma_chunked_send_tokens, num_tokens, x.data_ptr(), x)
+                                                 config.num_max_rdma_chunked_send_tokens, num_tokens, x.data_ptr(), x,
+                                                 comm_stream)
                                   : gpu_ctx,
                         dpa_fused(dpa_state));
 

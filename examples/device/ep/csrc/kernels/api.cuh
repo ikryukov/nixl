@@ -59,7 +59,10 @@ struct gpu_nixl_ctx {
         int *topk;          // [max_tokens][2 * num_topk]: topk_idx (int32) then weights (f32)
         float *scales;      // [max_tokens][num_scales]
         uint64_t round;
+        uint8_t *rec;       // 2-SGE mode: [num_rdma_ranks][max_tokens] records of scales | SourceMeta | topk_idx | weights
         int max_tokens, max_blocks, block_tokens;
+        int rec_bytes;      // record size in 2-SGE mode, 0 = 4-SGE mode (meta, topk, scales in separate buffers)
+        int fence_token;    // 1: system fence per token, 0: once per (sender warp, block)
     } dpa;
 
     __device__ inline uint64_t offset_get(uint64_t ptr) {

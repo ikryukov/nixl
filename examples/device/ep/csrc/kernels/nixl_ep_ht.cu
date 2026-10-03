@@ -681,6 +681,7 @@ __global__ void __launch_bounds__(((kFused ? kNumDispatchRDMASenderWarps + 2 + 2
         // DPA (SourceMeta per destination, topk, scales) and the coordinator publishes the per-block masks.
         const bool dpa = nixl_ctx.dpa.mbox != nullptr;
         const bool gpu_lane = not dpa or lane_id == rdma_rank;
+        int dpa_pending = 0; // tokens of the current block packed by this warp, not yet counted
         int64_t token_idx;
         int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
@@ -784,10 +785,34 @@ __global__ void __launch_bounds__(((kFused ? kNumDispatchRDMASenderWarps + 2 + 2
 
             if (dpa) {
                 const bool remote = lane_id < kNumRDMARanks and lane_id != rdma_rank and is_token_in_rank_uint64 != 0;
-                if (remote)
-                    reinterpret_cast<SourceMeta*>(nixl_ctx.dpa.meta)[lane_id * nixl_ctx.dpa.max_tokens + token_idx] =
-                        SourceMeta(rdma_rank, reinterpret_cast<const bool*>(&is_token_in_rank_uint64));
-                if (__any_sync(0xffffffff, remote)) {
+                const uint32_t remote_mask = __ballot_sync(0xffffffff, remote);
+                if (remote_mask != 0 and nixl_ctx.dpa.rec_bytes > 0) {
+                    // 2-SGE mode: one [scales | SourceMeta | topk_idx | weights] record per (destination, token)
+                    auto rec = [&](int d) {
+                        return reinterpret_cast<int*>(
+                            nixl_ctx.dpa.rec + (int64_t(d) * nixl_ctx.dpa.max_tokens + token_idx) * nixl_ctx.dpa.rec_bytes);
+                    };
+                    if (remote)
+                        *reinterpret_cast<SourceMeta*>(rec(lane_id) + num_scales) =
+                            SourceMeta(rdma_rank, reinterpret_cast<const bool*>(&is_token_in_rank_uint64));
+                    for (int i = lane_id; i < num_scales; i += 32) {
+                        const float v = ld_nc_global(x_scales + token_idx * scale_token_stride + i * scale_hidden_stride);
+                        for (uint32_t m = remote_mask; m; m &= m - 1)
+                            reinterpret_cast<float*>(rec(__ffs(m) - 1))[i] = v;
+                    }
+                    for (int i = lane_id; i < num_topk; i += 32) {
+                        const int idx = static_cast<int>(ld_nc_global(topk_idx + token_idx * num_topk + i));
+                        const float w = ld_nc_global(topk_weights + token_idx * num_topk + i);
+                        for (uint32_t m = remote_mask; m; m &= m - 1) {
+                            int* r = rec(__ffs(m) - 1) + num_scales + 2;
+                            r[i] = idx;
+                            reinterpret_cast<float*>(r)[num_topk + i] = w;
+                        }
+                    }
+                } else if (remote_mask != 0) {
+                    if (remote)
+                        reinterpret_cast<SourceMeta*>(nixl_ctx.dpa.meta)[lane_id * nixl_ctx.dpa.max_tokens + token_idx] =
+                            SourceMeta(rdma_rank, reinterpret_cast<const bool*>(&is_token_in_rank_uint64));
                     for (int i = lane_id; i < num_topk; i += 32) {
                         int* t = nixl_ctx.dpa.topk + token_idx * 2 * num_topk;
                         t[i] = static_cast<int>(ld_nc_global(topk_idx + token_idx * num_topk + i));
@@ -797,10 +822,19 @@ __global__ void __launch_bounds__(((kFused ? kNumDispatchRDMASenderWarps + 2 + 2
                         nixl_ctx.dpa.scales[token_idx * num_scales + i] =
                             ld_nc_global(x_scales + token_idx * scale_token_stride + i * scale_hidden_stride);
                 }
-                __syncwarp();
-                if (lane_id == 0) {
-                    __threadfence_system();
-                    atomicAdd_block(&dpa_block_done[(token_idx - token_start_idx) / dpa_block], 1);
+                // Count the token for its block. The packed pieces must reach system scope before the coordinator
+                // publishes the block: one fence per (warp, block), or per token.
+                ++dpa_pending;
+                const int64_t next = token_idx + kNumDispatchRDMASenderWarps;
+                const int b = static_cast<int>(token_idx - token_start_idx) / dpa_block;
+                if (nixl_ctx.dpa.fence_token or next >= token_end_idx or
+                    static_cast<int>(next - token_start_idx) / dpa_block != b) {
+                    __syncwarp();
+                    if (lane_id == 0) {
+                        __threadfence_system();
+                        atomicAdd_block(&dpa_block_done[b], dpa_pending);
+                    }
+                    dpa_pending = 0;
                 }
             }
 
