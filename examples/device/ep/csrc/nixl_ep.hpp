@@ -200,6 +200,9 @@ public:
     Buffer(int rank, bool explicitly_destroy, bool low_latency_mode, int timeout_ms);
 
     void dpa_init(const pybind11::function& all_gather_object);
+    // DPA peer connections follow connect_ranks / disconnect_ranks (collective over the EP group)
+    void dpa_connect_ranks(const std::vector<int>& ranks);
+    void dpa_disconnect_ranks(const std::vector<int>& ranks);
 
     void update_memory_buffers(int num_ranks, int num_experts_per_rank, int64_t num_rdma_bytes, int64_t num_nvl_bytes = 0);
 
