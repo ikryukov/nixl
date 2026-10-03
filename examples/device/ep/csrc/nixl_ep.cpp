@@ -1675,6 +1675,8 @@ void Buffer::_nixl_ep_init(void) {
         .num_rdma_ranks = num_rdma_ranks,
         .rank = rank,
     };
+    // NIXL_EP_TMA_STAGES=1: one TMA stage per token copy in the HT dispatch (default: 2 when they fit)
+    gpu_ctx.tma_stages = std::getenv("NIXL_EP_TMA_STAGES") ? std::atoi(std::getenv("NIXL_EP_TMA_STAGES")) : 2;
     CUDA_CHECK(cudaMalloc(&gpu_ctx.p2p_ptrs, max_num_ranks * sizeof(void*)));
     CUDA_CHECK(cudaMemset(gpu_ctx.p2p_ptrs, 0, max_num_ranks * sizeof(void*)));
     CUDA_CHECK(cudaMalloc(&gpu_ctx_ptr, sizeof(gpu_nixl_ctx)));

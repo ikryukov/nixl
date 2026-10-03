@@ -615,16 +615,22 @@ __global__ void __launch_bounds__(((kFused ? kNumDispatchRDMASenderWarps + 2 + 2
     __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks];
     auto sync_rdma_sender_smem = []() { asm volatile("barrier.sync 0, %0;" ::"r"((kNumDispatchRDMASenderWarps + 1) * 32)); };
 
-    // TMA stuffs
+    // TMA stuffs: the kNumTMABytesPerWarp of a forwarder / NVL receiver warp hold tma_stages stages of [token | mbarrier].
+    // With 2 stages the load of a token overlaps the store of the previous one.
     extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
     const int tma_slot = (kFused and warp_role == WarpRole::kNVLReceivers ? NUM_MAX_NVL_PEERS : 0) + target_rank;
     auto tma_buffer = smem_tma_buffer + tma_slot * kNumTMABytesPerWarp;
-    auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
-    uint32_t tma_phase = 0;
+    const int tma_stage_bytes = align_up<int>(num_bytes_per_token, 128) + 128;
+    const int tma_stages = nixl_ctx.tma_stages >= 2 and 2 * tma_stage_bytes <= kNumTMABytesPerWarp ? 2 : 1;
+    auto tma_stage = [=](int s) { return tma_buffer + s * tma_stage_bytes; };
+    auto tma_mbarrier = [=](int s) { return reinterpret_cast<uint64_t*>(tma_stage(s) + tma_stage_bytes - 128); };
+    uint32_t tma_phase[2] = {0, 0};
+    int tma_iter = 0;
     if ((warp_role == WarpRole::kRDMAAndNVLForwarder or warp_role == WarpRole::kNVLReceivers) and elect_one_sync()) {
-        mbarrier_init(tma_mbarrier, 1);
+        for (int s = 0; s < tma_stages; ++s)
+            mbarrier_init(tma_mbarrier(s), 1);
         fence_barrier_init();
-        EP_DEVICE_ASSERT(num_bytes_per_token + sizeof(uint64_t) <= kNumTMABytesPerWarp);
+        EP_DEVICE_ASSERT(tma_stages * tma_stage_bytes <= kNumTMABytesPerWarp);
     }
     __syncwarp();
 
@@ -1149,25 +1155,32 @@ __global__ void __launch_bounds__(((kFused ? kNumDispatchRDMASenderWarps + 2 + 2
                 int dst_slot_idx = (cached_nvl_channel_tail++) % num_max_nvl_chunked_recv_tokens;
                 auto dst_shifted = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
 
-                // Copy data
+                // Copy data; with 2 stages, first wait for the store that last used this stage (2 tokens ago)
+                const int st = tma_iter++ % tma_stages;
+                if (tma_stages == 2)
+                    tma_store_wait<1>();
                 if (elect_one_sync()) {
-                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, num_bytes_per_token, false);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, num_bytes_per_token);
+                    tma_load_1d(tma_stage(st), shifted, tma_mbarrier(st), num_bytes_per_token, false);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier(st), num_bytes_per_token);
                 }
                 __syncwarp();
-                mbarrier_wait(tma_mbarrier, tma_phase);
+                mbarrier_wait(tma_mbarrier(st), tma_phase[st]);
                 if (elect_one_sync())
-                    tma_store_1d(tma_buffer, dst_shifted, num_bytes_per_token);
+                    tma_store_1d(tma_stage(st), dst_shifted, num_bytes_per_token);
                 __syncwarp();
 
                 // In case of insufficient NVL buffers, early stopping
                 if ((++num_tokens_sent) == num_max_nvl_chunked_send_tokens)
                     src_rdma_tail = i + 1;
 
-                // Wait TMA to be finished
-                tma_store_wait<0>();
-                __syncwarp();
+                // Wait TMA to be finished (with 2 stages: once, below)
+                if (tma_stages == 1) {
+                    tma_store_wait<0>();
+                    __syncwarp();
+                }
             }
+            tma_store_wait<0>();
+            __syncwarp();
 
             // Sync head index
             if (lane_id == src_rdma_rank)
@@ -1313,17 +1326,24 @@ __global__ void __launch_bounds__(((kFused ? kNumDispatchRDMASenderWarps + 2 + 2
                 bool scale_aligned = (scale_bytes % 16 == 0);
                 auto tma_load_bytes = hidden_bytes + (scale_aligned ? scale_bytes : 0);
 
-                // Copy data
+                // Copy data; with 2 stages, first wait for the stores that last used this stage (1 or 2 bulk groups per token)
+                const int st = tma_iter++ % tma_stages;
+                if (tma_stages == 2) {
+                    if (scale_aligned)
+                        tma_store_wait<2>();
+                    else
+                        tma_store_wait<1>();
+                }
                 if (elect_one_sync()) {
-                    tma_load_1d(tma_buffer, shifted, tma_mbarrier, tma_load_bytes);
-                    mbarrier_arrive_and_expect_tx(tma_mbarrier, tma_load_bytes);
+                    tma_load_1d(tma_stage(st), shifted, tma_mbarrier(st), tma_load_bytes);
+                    mbarrier_arrive_and_expect_tx(tma_mbarrier(st), tma_load_bytes);
                 }
                 __syncwarp();
-                mbarrier_wait(tma_mbarrier, tma_phase);
+                mbarrier_wait(tma_mbarrier(st), tma_phase[st]);
                 if (elect_one_sync()) {
-                    tma_store_1d(tma_buffer, recv_x + recv_token_idx * hidden_int4, hidden_bytes, false);
+                    tma_store_1d(tma_stage(st), recv_x + recv_token_idx * hidden_int4, hidden_bytes, false);
                     if (scale_aligned)
-                        tma_store_1d(tma_buffer + hidden_bytes, recv_x_scales + recv_token_idx * num_scales, scale_bytes, false);
+                        tma_store_1d(tma_stage(st) + hidden_bytes, recv_x_scales + recv_token_idx * num_scales, scale_bytes, false);
                 }
                 __syncwarp();
                 shifted += hidden_bytes;
@@ -1360,10 +1380,14 @@ __global__ void __launch_bounds__(((kFused ? kNumDispatchRDMASenderWarps + 2 + 2
                     st_na_global(recv_topk_weights + recv_idx, weight_value);
                 }
 
-                // Wait TMA to be finished
-                tma_store_wait<0>();
-                __syncwarp();
+                // Wait TMA to be finished (with 2 stages: once, below)
+                if (tma_stages == 1) {
+                    tma_store_wait<0>();
+                    __syncwarp();
+                }
             }
+            tma_store_wait<0>();
+            __syncwarp();
 
             // Move queue
             if (elect_one_sync())

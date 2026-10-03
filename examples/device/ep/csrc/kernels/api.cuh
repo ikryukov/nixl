@@ -50,6 +50,7 @@ struct gpu_nixl_ctx {
     int max_num_ranks;
     int num_rdma_ranks;
     int rank;
+    int tma_stages; // HT dispatch forwarders / NVL receivers: 2 = pipeline the per-token TMA copy when 2 stages fit
     // DPA offload of the HT dispatch RDMA leg (mbox == nullptr: GPU path). Per (channel, rdma rank, block of
     // block_tokens channel tokens) the sender publishes {round, mask_lo, mask_hi, first token}; the DPA
     // gathers x | scales | meta | topk of every set token straight into the peer's ring (see epdpa_stream.h).

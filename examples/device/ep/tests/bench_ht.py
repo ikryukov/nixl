@@ -5,11 +5,13 @@ sys.path.insert(0, os.path.join(os.environ["NIXL_EP_SRC"], "tests"))
 sys.path.insert(0, os.path.join(os.environ["NIXL_EP_SRC"], "tests", "elastic"))
 import torch, torch.distributed as dist
 import nixl_ep, store_group
-from utils import bench_kineto, create_grouped_scores, inplace_unique, per_token_cast_to_fp8
+from utils import bench_kineto, create_grouped_scores, inplace_unique, per_token_cast_back, per_token_cast_to_fp8
 
 p = argparse.ArgumentParser()
 p.add_argument("--sms", default="12,16,20,24,32")
 p.add_argument("--wt", action="store_true")
+p.add_argument("--cwt", action="store_true")
+p.add_argument("--sanity-dtype", default="bf16", choices=["bf16", "fp8"])
 p.add_argument("--sanity", type=int, default=0)
 p.add_argument("--quick", action="store_true")
 p.add_argument("--ring", type=int, default=128)
@@ -66,23 +68,28 @@ if a.sanity:
     sms = int(a.sms.split(",")[0])
     kw = dict(num_tokens_per_rank=ntpr, num_tokens_per_rdma_rank=ntprr, is_token_in_rank=is_in,
               num_tokens_per_expert=ntpe, topk_idx=topk_idx, topk_weights=topk_w, config=cfg(sms, 8, 16))
+    # FP8: x and its per-token scales are dispatched; the reference is the dequantized x
+    xv = x_fp8 if a.sanity_dtype == "fp8" else x
+    xref = per_token_cast_back(*x_fp8) if a.sanity_dtype == "fp8" else x
     for mode in ("fresh", "cached", "cached_nosync"):
         t0 = time.time()
         for i in range(a.sanity):
             if mode == "fresh" or i == 0:
-                r = buf.ht_dispatch(x=x, **kw)
+                r = buf.ht_dispatch(x=xv, **kw)
                 handle = r[4]
                 if i == 0:
                     # validation as in tests/test_ht.py: every rank receives exactly its routed token count
                     gbl = ntpr.clone(); dist.all_reduce(gbl)
-                    assert r[0].size(0) == gbl[rank].item(), f"recv {r[0].size(0)} != {gbl[rank].item()}"
-                    c = buf.ht_combine(x=r[0], handle=handle, config=cfg(sms, 4, 16))[0].float()
-                    ref = x.float() * is_in.sum(dim=1, keepdim=True)
+                    rx = r[0][0] if isinstance(r[0], tuple) else r[0]
+                    assert rx.size(0) == gbl[rank].item(), f"recv {rx.size(0)} != {gbl[rank].item()}"
+                    cin = per_token_cast_back(*r[0]) if isinstance(r[0], tuple) else r[0]
+                    c = buf.ht_combine(x=cin, handle=handle, config=cfg(sms, 4, 16))[0].float()
+                    ref = xref.float() * is_in.sum(dim=1, keepdim=True)
                     err = ((c - ref).abs().max() / ref.abs().max().clamp(min=1e-6)).item()
                     assert err < 2e-2, f"combine rel err {err}"
-                    log(f"[sanity] validation ok (recv {r[0].size(0)} tokens, combine rel err {err:.1e})")
+                    log(f"[sanity] validation ok ({a.sanity_dtype}, recv {rx.size(0)} tokens, combine rel err {err:.1e})")
             else:
-                buf.ht_dispatch(x=x, handle=handle, config=cfg(sms, 8, 16))
+                buf.ht_dispatch(x=xv, handle=handle, config=cfg(sms, 8, 16))
             if mode != "cached_nosync":
                 torch.cuda.synchronize(); dist.barrier()
             if i % 50 == 0:
@@ -125,6 +132,14 @@ for sms in (int(s) for s in a.sms.split(",")):
             if best is None or t.item() < best[0]:
                 best = (t.item(), nvl, rdma)
     log(f"[combine]  sms {sms:2d} bf16: {best[0]*1e6:8.1f} us (nvl {best[1]}, rdma {best[2]})")
+    if a.cwt:
+        c = cfg(sms, best[1], best[2])
+        for _ in range(5):
+            fenced(lambda: buf.ht_combine(x=recv_x, handle=handle, config=c))()
+        os.environ["NIXL_EP_CWT_DUMP"] = "1"
+        buf.ht_combine(x=recv_x, handle=handle, config=c)
+        os.environ["NIXL_EP_CWT_DUMP"] = "0"
+        torch.cuda.synchronize(); dist.barrier()
 
 buf.destroy()
 dist.barrier()
