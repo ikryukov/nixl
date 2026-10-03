@@ -50,6 +50,17 @@ struct gpu_nixl_ctx {
     int max_num_ranks;
     int num_rdma_ranks;
     int rank;
+    // DPA offload of the HT dispatch RDMA leg (mbox == nullptr: GPU path). Per (channel, rdma rank, block of
+    // block_tokens channel tokens) the sender publishes {round, mask_lo, mask_hi, first token}; the DPA
+    // gathers x | scales | meta | topk of every set token straight into the peer's ring (see epdpa_stream.h).
+    struct {
+        uint64_t *mbox;     // [num_channels][num_rdma_ranks][max_blocks][4]
+        uint64_t *meta;     // SourceMeta [num_rdma_ranks][max_tokens]
+        int *topk;          // [max_tokens][2 * num_topk]: topk_idx (int32) then weights (f32)
+        float *scales;      // [max_tokens][num_scales]
+        uint64_t round;
+        int max_tokens, max_blocks, block_tokens;
+    } dpa;
 
     __device__ inline uint64_t offset_get(uint64_t ptr) {
         return ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr);

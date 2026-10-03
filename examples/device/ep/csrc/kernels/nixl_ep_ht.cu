@@ -589,6 +589,12 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     // RDMA sender warp synchronization
     // NOTES: `rdma_send_channel_tail` means the latest released tail
     // NOTES: `rdma_send_channel_window` means the ongoing 32 transactions' status
+    // DPA mode: tokens of each dpa_block block of the channel packed so far by the sender warps. The DPA
+    // signals the tail once per block and receivers return credit in chunked_send steps, so a block must fit in
+    // the ring with chunked_send to spare (host asserts block + chunked_send <= ring).
+    constexpr int kDpaMaxBlocks = 128;
+    const int dpa_block = nixl_ctx.dpa.block_tokens;
+    __shared__ int dpa_block_done[kDpaMaxBlocks];
     __shared__ int rdma_send_channel_lock[kNumRDMARanks];
     __shared__ int rdma_send_channel_tail[kNumRDMARanks];
     __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks];
@@ -655,6 +661,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         sync_rdma_sender_smem();
 
         // Iterate over tokens and copy into buffer
+        // DPA mode: only the self rdma rank goes through the GPU ring; remote ranks get their pieces packed for the
+        // DPA (SourceMeta per destination, topk, scales) and the coordinator publishes the per-block masks.
+        const bool dpa = nixl_ctx.dpa.mbox != nullptr;
+        const bool gpu_lane = not dpa or lane_id == rdma_rank;
         int64_t token_idx;
         int cached_rdma_channel_head = 0, global_rdma_tail_idx = 0;
         auto send_buffer = lane_id == rdma_rank ? rdma_channel_data.recv_buffer(lane_id) : rdma_channel_data.send_buffer(lane_id);
@@ -675,7 +685,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
             // Wait the remote buffer to be released
             auto start_time = clock64();
-            while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
+            while (gpu_lane and is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
                 cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
 
                 // Timeout check
@@ -702,7 +712,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             void* dst_send_buffers[kNumTopkRDMARanks];
             #pragma unroll
             for (int i = 0, slot_idx; i < kNumRDMARanks; ++i)
-                if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0) {
+                if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0 and (not dpa or i == rdma_rank)) {
                     slot_idx = slot_idx % num_max_rdma_chunked_recv_tokens;
                     topk_ranks[num_topk_ranks] = i;
                     auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i);
@@ -756,8 +766,30 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             }
             __syncwarp();
 
+            if (dpa) {
+                const bool remote = lane_id < kNumRDMARanks and lane_id != rdma_rank and is_token_in_rank_uint64 != 0;
+                if (remote)
+                    reinterpret_cast<SourceMeta*>(nixl_ctx.dpa.meta)[lane_id * nixl_ctx.dpa.max_tokens + token_idx] =
+                        SourceMeta(rdma_rank, reinterpret_cast<const bool*>(&is_token_in_rank_uint64));
+                if (__any_sync(0xffffffff, remote)) {
+                    for (int i = lane_id; i < num_topk; i += 32) {
+                        int* t = nixl_ctx.dpa.topk + token_idx * 2 * num_topk;
+                        t[i] = static_cast<int>(ld_nc_global(topk_idx + token_idx * num_topk + i));
+                        reinterpret_cast<float*>(t)[num_topk + i] = ld_nc_global(topk_weights + token_idx * num_topk + i);
+                    }
+                    for (int i = lane_id; i < num_scales; i += 32)
+                        nixl_ctx.dpa.scales[token_idx * num_scales + i] =
+                            ld_nc_global(x_scales + token_idx * scale_token_stride + i * scale_hidden_stride);
+                }
+                __syncwarp();
+                if (lane_id == 0) {
+                    __threadfence_system();
+                    atomicAdd_block(&dpa_block_done[(token_idx - token_start_idx) / dpa_block], 1);
+                }
+            }
+
             // Release the transaction in the window
-            if (is_token_in_rank_uint64 != 0) {
+            if (gpu_lane and is_token_in_rank_uint64 != 0) {
                 // Acquire lock first
                 acquire_lock(rdma_send_channel_lock + lane_id);
                 auto latest_tail = rdma_send_channel_tail[lane_id];
@@ -793,6 +825,12 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         (lane_id < kNumRDMARanks) ? (rdma_send_channel_lock[lane_id] = 0) : 0;
         (lane_id < kNumRDMARanks) ? (rdma_send_channel_tail[lane_id] = 0) : 0;
         (lane_id < kNumRDMARanks) ? (rdma_send_channel_window[lane_id] = 0) : 0;
+        const bool dpa = nixl_ctx.dpa.mbox != nullptr;
+        if (dpa) {
+            EP_DEVICE_ASSERT(nixl_ctx.dpa.max_blocks <= kDpaMaxBlocks);
+            for (int i = lane_id; i < kDpaMaxBlocks; i += 32)
+                dpa_block_done[i] = 0;
+        }
 
         // Synchronize shared memory
         sync_rdma_sender_smem();
@@ -803,12 +841,50 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             num_tokens_to_send = rdma_channel_prefix_matrix[lane_id * num_channels + channel_id];
             if (channel_id > 0)
                 num_tokens_to_send -= rdma_channel_prefix_matrix[lane_id * num_channels + channel_id - 1];
+            if (dpa and lane_id != rdma_rank)
+                num_tokens_to_send = 0;  // sent by the DPA
         }
+
+        // DPA mode: publish the per-destination masks of each block once its tokens are packed; blocks past the
+        // channel's range are published empty so the DPA streams can finish.
+        int token_start_idx, token_end_idx;
+        get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+        int dpa_next_block = dpa ? 0 : nixl_ctx.dpa.max_blocks;
+        auto dpa_publish = [&]() {
+            const int b = dpa_next_block;
+            const int first = token_start_idx + b * dpa_block;
+            const int count = max(0, min(dpa_block, token_end_idx - first));
+            if (count > 0 and *reinterpret_cast<volatile int*>(&dpa_block_done[b]) < count)
+                return;
+            uint64_t lo = 0, hi = 0;
+            for (int w = 0; w < dpa_block / 32; ++w) {
+                const int t = first + w * 32 + lane_id;
+                for (int d = 0; d < kNumRDMARanks; ++d) {
+                    const bool in = (w * 32 + lane_id) < count and
+                                    __ldg(reinterpret_cast<const nvl_mask_t*>(is_token_in_rank + int64_t(t) * num_ranks +
+                                                                             d * NUM_MAX_NVL_PEERS)) != 0;
+                    const uint64_t bits = __ballot_sync(0xffffffff, in);
+                    if (lane_id == d)
+                        (w < 2 ? lo : hi) |= bits << (32 * (w & 1));
+                }
+            }
+            if (lane_id < kNumRDMARanks and lane_id != rdma_rank) {
+                uint64_t* e = nixl_ctx.dpa.mbox +
+                              ((int64_t(channel_id) * kNumRDMARanks + lane_id) * kDpaMaxBlocks + b) * 4;
+                e[1] = lo, e[2] = hi, e[3] = first;
+                __threadfence_system();
+                st_release_sys_global(reinterpret_cast<uint64_t*>(e), nixl_ctx.dpa.round);
+            }
+            __syncwarp();
+            ++dpa_next_block;
+        };
 
         // Iterate all RDMA ranks
         int last_issued_tail = 0;
         auto start_time = clock64();
-        while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
+        while (__any_sync(0xffffffff, num_tokens_to_send > 0) or dpa_next_block < nixl_ctx.dpa.max_blocks) {
+            if (dpa_next_block < nixl_ctx.dpa.max_blocks)
+                dpa_publish();
             // Timeout check
             if (clock64() - start_time > timeout_cycles and lane_id < kNumRDMARanks) {
                 printf("NixlEP RDMA sender coordinator timeout, channel: %d, IB: %d, nvl %d, dst IB: %d, tail: %d, remaining: %d\n",

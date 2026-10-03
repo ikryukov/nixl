@@ -37,6 +37,12 @@
 #include <cstdio>
 #include <limits>
 #include <unordered_set>
+#include <dlfcn.h>
+#include <map>
+#include <tuple>
+#ifdef NIXL_EP_DPA
+#include <epdpa.h>
+#endif
 
 #define NIXL_ETCD_WATCH_TIMEOUT std::chrono::microseconds(1000000000) // 1000 seconds
 
@@ -105,6 +111,223 @@ int Buffer::get_rank_bound(std::optional<int> num_experts) const {
     EP_HOST_ASSERT(*num_experts >= active_expert_bound and *num_experts <= max_num_experts);
     return *num_experts / num_experts_per_rank;
 }
+
+// ---- DPA offload of the HT dispatch RDMA leg (libepdpa, loaded with dlopen; build with -Dnixl_ep_dpa_inc) ----
+#ifdef NIXL_EP_DPA
+// One DPA stream per (channel, remote rdma rank) gathers x | scales | SourceMeta | topk of every token the
+// dispatch kernel publishes in the stream's mailbox straight into the peer's ring slot, waits for ring credit
+// on head.buffer(dst) and adds each block's token count to the peer's tail.buffer(my rdma rank) (atomic fetch-add).
+static constexpr int kDpaChannels = 16, kDpaMaxBlocks = 128, kDpaMaxBlockTokens = 128, kDpaMaxInflight = 8;
+static constexpr int kDpaMaxTopK = 128, kDpaMaxScales = 128;
+static constexpr size_t kDpaAlign = 1 << 16;
+
+static int dpa_max_tokens() {
+    const char* v = std::getenv("NIXL_EP_DPA_MAX_TOKENS");
+    return v ? std::atoi(v) : 16384;
+}
+
+struct DpaScratch {
+    size_t mbox, sig, meta, topk, scales, end;
+    explicit DpaScratch(int num_rdma_ranks) {
+        auto up = [](size_t v) { return (v + kDpaAlign - 1) / kDpaAlign * kDpaAlign; };
+        const size_t t = dpa_max_tokens();
+        mbox = 0;
+        sig = up(mbox + size_t(kDpaChannels) * num_rdma_ranks * kDpaMaxBlocks * 32);
+        meta = up(sig + size_t(kDpaChannels) * num_rdma_ranks * EPDPA_SIG_SLOTS * 8);
+        topk = up(meta + size_t(num_rdma_ranks) * t * 8);
+        scales = up(topk + t * 2 * kDpaMaxTopK * 4);
+        end = up(scales + t * kDpaMaxScales * 4);
+    }
+};
+
+size_t dpa_scratch_offset(int64_t num_rdma_bytes) {
+    return (static_cast<size_t>(num_rdma_bytes) + (2u << 20) - 1) / (2u << 20) * (2u << 20);
+}
+
+size_t dpa_scratch_size(int num_rdma_ranks) {
+    return DpaScratch(num_rdma_ranks).end;
+}
+
+struct DpaPeer {
+    uint64_t base;
+    uint32_t rkey, sig_rkey;
+};
+
+struct DpaState {
+    decltype(&epdpa_core_create) core_create;
+    decltype(&epdpa_reg) reg;
+    decltype(&epdpa_reg_cached) reg_cached;
+    decltype(&epdpa_window) window;
+    decltype(&epdpa_connect) connect;
+    decltype(&epdpa_streams) streams;
+    decltype(&epdpa_launch) launch;
+    decltype(&epdpa_allgather) allgather;
+    epdpa_core* core = nullptr;
+    const pybind11::function* ag = nullptr;
+    int rank = 0;
+    uint8_t* base = nullptr; // rdma buffer, scratch at scratch_off
+    size_t scratch_off = 0;
+    DpaScratch layout{1};
+    ibv_mr *mr = nullptr, *sig_mr = nullptr;
+    doca_dpa_dev_mmap_t mm = 0;
+    std::vector<DpaPeer> peers;
+    std::vector<doca_dpa_dev_verbs_qp_t> qp; // [channel][remote rdma index]
+    std::vector<doca_dpa_dev_completion_t> comp;
+    std::map<std::tuple<int, int, int, int>, std::pair<uint64_t, int>> launch_streams; // (channels, bpt, ring, block)
+    uint64_t round = 0;
+};
+
+static int dpa_allgather_cb(void* user, void* buf, size_t elem) {
+    auto* d = static_cast<DpaState*>(user);
+    pybind11::gil_scoped_acquire gil;
+    auto* b = static_cast<char*>(buf);
+    auto all = (*d->ag)(pybind11::bytes(b + size_t(d->rank) * elem, elem)).cast<pybind11::list>();
+    for (size_t i = 0; i < all.size(); ++i) {
+        const std::string s = all[i].cast<std::string>();
+        EP_HOST_ASSERT(s.size() == elem);
+        std::memcpy(b + i * elem, s.data(), elem);
+    }
+    return 0;
+}
+
+void Buffer::dpa_init(const pybind11::function& all_gather_object) {
+    EP_HOST_ASSERT(not low_latency_mode and dpa_scratch_bytes > 0 and dpa_state == nullptr);
+    const char* lib = std::getenv("NIXL_EP_DPA_LIB") ? std::getenv("NIXL_EP_DPA_LIB") : "libepdpa.so";
+    void* h = dlopen(lib, RTLD_NOW | RTLD_GLOBAL);
+    if (h == nullptr)
+        throw std::runtime_error(std::string("NIXL_EP_DPA: dlopen failed: ") + dlerror());
+    auto* d = new DpaState();
+#define DPA_SYM(field, name) EP_HOST_ASSERT((d->field = reinterpret_cast<decltype(d->field)>(dlsym(h, #name))) != nullptr)
+    DPA_SYM(core_create, epdpa_core_create);
+    DPA_SYM(reg, epdpa_reg);
+    DPA_SYM(reg_cached, epdpa_reg_cached);
+    DPA_SYM(window, epdpa_window);
+    DPA_SYM(connect, epdpa_connect);
+    DPA_SYM(streams, epdpa_streams);
+    DPA_SYM(launch, epdpa_launch);
+    DPA_SYM(allgather, epdpa_allgather);
+#undef DPA_SYM
+    d->ag = &all_gather_object;
+    d->rank = rank;
+    d->base = static_cast<uint8_t*>(rdma_buffer_ptr);
+    d->scratch_off = dpa_scratch_offset(num_rdma_bytes);
+    d->layout = DpaScratch(num_rdma_ranks);
+    const size_t total = d->scratch_off + dpa_scratch_bytes;
+    EP_HOST_ASSERT(d->core_create(&d->core, rank, num_rdma_ranks * NUM_MAX_NVL_PEERS, device_id, dpa_allgather_cb, d) == 0);
+    d->mr = d->reg(d->core, d->base, total, 1);
+    d->sig_mr = d->reg(d->core, d->base, total, 0); // tail signals must land after the data: no relaxed ordering
+    EP_HOST_ASSERT(d->mr and d->sig_mr and d->window(d->core, d->base, total, &d->mm) == 0);
+
+    DpaPeer me{reinterpret_cast<uint64_t>(d->base), d->mr->rkey, d->sig_mr->rkey};
+    d->peers.resize(num_rdma_ranks * NUM_MAX_NVL_PEERS);
+    d->peers[rank] = me;
+    EP_HOST_ASSERT(d->allgather(d->core, d->peers.data(), sizeof(DpaPeer)) == 0);
+
+    // QP (channel, remote rdma rank d) <-> rank d * NVL + nvl_rank, tag = channel
+    std::vector<int> peer, tag;
+    for (int ch = 0; ch < kDpaChannels; ++ch)
+        for (int r = 0; r < num_rdma_ranks; ++r)
+            if (r != rdma_rank)
+                peer.push_back(r * NUM_MAX_NVL_PEERS + nvl_rank), tag.push_back(ch);
+    const int n = static_cast<int>(peer.size());
+    d->qp.resize(n);
+    d->comp.resize(n);
+    EP_HOST_ASSERT(d->connect(d->core, n, peer.data(), tag.data(), (kDpaMaxBlockTokens + 1) * kDpaMaxInflight + 16,
+                              kDpaMaxInflight, d->qp.data(), d->comp.data()) == 0);
+    d->ag = nullptr;
+    dpa_state = d;
+    if (rank == 0)
+        printf("[nixl_ep] DPA offload of the HT dispatch RDMA leg: %d QPs, scratch %.1f MB\n", n, dpa_scratch_bytes / 1e6);
+
+    const auto& L = d->layout;
+    uint8_t* s = d->base + d->scratch_off;
+    gpu_ctx.dpa.mbox = reinterpret_cast<uint64_t*>(s + L.mbox);
+    gpu_ctx.dpa.meta = reinterpret_cast<uint64_t*>(s + L.meta);
+    gpu_ctx.dpa.topk = reinterpret_cast<int*>(s + L.topk);
+    gpu_ctx.dpa.scales = reinterpret_cast<float*>(s + L.scales);
+    gpu_ctx.dpa.max_tokens = dpa_max_tokens();
+    CUDA_CHECK(cudaMemset(s, 0, L.sig)); // mailboxes start at round 0
+}
+
+// Builds (once per layout) the streams of this dispatch and launches the DPA; returns the kernel's DPA view.
+static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx, int rdma_rank, int num_rdma_ranks,
+                                          int num_channels, int hidden_bytes, int num_scales, int num_topk,
+                                          int ring, int chunked_send, int num_tokens, const void* x,
+                                          const torch::Tensor& x_tensor) {
+    // Block size: NIXL_EP_DPA_BLOCK, else the largest of 128/64 that fits in the ring with chunked_send to spare.
+    const char* bs = std::getenv("NIXL_EP_DPA_BLOCK");
+    const int block = bs ? std::atoi(bs) : (kDpaMaxBlockTokens + chunked_send <= ring ? kDpaMaxBlockTokens : 64);
+    EP_HOST_ASSERT(num_channels <= kDpaChannels and num_topk <= kDpaMaxTopK and num_scales <= kDpaMaxScales and
+                   num_tokens <= ctx.dpa.max_tokens and block % 32 == 0 and block <= kDpaMaxBlockTokens and
+                   block + chunked_send <= ring);
+    const int bpt = (hidden_bytes + num_scales * 4 + 8 + num_topk * 8 + 15) / 16 * 16; // ht::get_num_bytes_per_token
+    const auto key = std::make_tuple(num_channels, bpt, ring, block);
+    auto it = d->launch_streams.find(key);
+    if (it == d->launch_streams.end()) {
+        // RDMA buffer layout of the dispatch kernel (SymBuffer chain): data, meta, head, tail
+        const int64_t R = num_rdma_ranks, data_ch = int64_t(ring) * bpt * R;
+        const int64_t head_off = data_ch * num_channels * 2 + int64_t(NUM_MAX_NVL_PEERS * 2 + 2) * 4 * R * num_channels * 2;
+        const int64_t tail_off = head_off + 8 * R * num_channels;
+        const auto& L = d->layout;
+        const uint64_t scratch = reinterpret_cast<uint64_t>(d->base) + d->scratch_off;
+        std::vector<epdpa_stream> st;
+        for (int ch = 0; ch < num_channels; ++ch)
+            for (int r = 0, q = 0; r < num_rdma_ranks; ++r) {
+                if (r == rdma_rank)
+                    continue;
+                const DpaPeer& p = d->peers[r * NUM_MAX_NVL_PEERS + (d->rank % NUM_MAX_NVL_PEERS)];
+                const int qi = ch * (num_rdma_ranks - 1) + q++;
+                epdpa_stream s{};
+                s.comp = d->comp[qi], s.qp = d->qp[qi], s.mm = d->mm;
+                s.sig_lkey = d->mr->lkey, s.rkey = p.rkey, s.sig_rkey = p.sig_rkey, s.nsge = 4;
+                for (int i = 0; i < EPDPA_MAX_SGE; ++i)
+                    s.mul[i] = 1;
+                s.add[2] = static_cast<uint32_t>(r * ctx.dpa.max_tokens); // SourceMeta [dst][token]
+                s.mbox = scratch + L.mbox + (uint64_t(ch) * R + r) * kDpaMaxBlocks * 32;
+                s.block_tokens = block, s.first_block = 0, s.block_step = 1, s.nblocks = kDpaMaxBlocks;
+                s.dst_base = p.base + data_ch * (ch + num_channels) + int64_t(ring) * bpt * rdma_rank;
+                s.dst_stride = bpt;
+                s.ring = ring, s.max_inflight = kDpaMaxInflight;
+                s.credit = reinterpret_cast<uint64_t>(d->base) + head_off + 8 * (R * ch + r);
+                s.sig_src = scratch + L.sig + uint64_t(qi) * EPDPA_SIG_SLOTS * 8;
+                s.sig_dst = p.base + tail_off + 8 * (R * ch + rdma_rank);
+                s.sig_mode = EPDPA_SIG_TAIL, s.tok_from_mbox = 1;
+                st.push_back(s);
+            }
+        uint64_t h = 0;
+        EP_HOST_ASSERT(d->streams(d->core, st.data(), static_cast<int>(st.size()), &h) == 0);
+        it = d->launch_streams.emplace(key, std::make_pair(h, static_cast<int>(st.size()))).first;
+    }
+    const auto& L = d->layout;
+    const uint64_t scratch = reinterpret_cast<uint64_t>(d->base) + d->scratch_off;
+    const int tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
+    struct epdpa_launch p{};
+    p.round = ++d->round;
+    p.addr[0] = reinterpret_cast<uint64_t>(x), p.len[0] = hidden_bytes;
+    p.lkey[0] = d->reg_cached(d->core, x, x_tensor.numel() * x_tensor.element_size());
+    p.addr[1] = scratch + L.scales, p.len[1] = num_scales * 4, p.lkey[1] = d->mr->lkey;
+    p.addr[2] = scratch + L.meta, p.len[2] = 8, p.lkey[2] = d->mr->lkey;
+    p.addr[3] = scratch + L.topk, p.len[3] = num_topk * 8, p.lkey[3] = d->mr->lkey;
+    p.nblocks = (tokens_per_channel + block - 1) / block;
+    EP_HOST_ASSERT(p.lkey[0] != 0 and p.nblocks <= kDpaMaxBlocks);
+    EP_HOST_ASSERT(d->launch(d->core, it->second.first, it->second.second, &p) == 0);
+    ctx.dpa.round = p.round;
+    ctx.dpa.max_blocks = static_cast<int>(p.nblocks);
+    ctx.dpa.block_tokens = block;
+    return ctx;
+}
+#else
+size_t dpa_scratch_offset(int64_t num_rdma_bytes) { return static_cast<size_t>(num_rdma_bytes); }
+size_t dpa_scratch_size(int) { return 0; }
+struct DpaState {};
+void Buffer::dpa_init(const pybind11::function&) {
+    throw std::runtime_error("NIXL_EP_DPA=1 needs nixl_ep built with -Dnixl_ep_dpa_inc=<libepdpa include dir>");
+}
+static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState*, nixl_ep::gpu_nixl_ctx ctx, int, int, int, int, int, int, int, int,
+                                          int, const void*, const torch::Tensor&) {
+    return ctx;
+}
+#endif
 
 void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes, int64_t num_rdma_bytes)
 {
@@ -182,7 +405,11 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
         *moe_recv_rdma_counter = -1;
     }
 
-    m_rdma_alloc = std::make_unique<vmm_region>(static_cast<size_t>(num_rdma_bytes));
+    // DPA mode: the DPA scratch (mailboxes, packed token pieces, signal sources) lives after the RDMA buffer so a
+    // single Data Direct MR and DPA window cover it together with the head/tail counters.
+    dpa_scratch_bytes = (std::getenv("NIXL_EP_DPA") and std::string(std::getenv("NIXL_EP_DPA")) == "1" and
+                         not low_latency_mode) ? dpa_scratch_size(num_rdma_ranks) : 0;
+    m_rdma_alloc = std::make_unique<vmm_region>(static_cast<size_t>(dpa_scratch_offset(num_rdma_bytes) + dpa_scratch_bytes));
     rdma_buffer_ptr = m_rdma_alloc->ptr();
     CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
 
@@ -851,7 +1078,12 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                         rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                         buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
                         rank, num_ranks, cached_mode,
-                        comm_stream, num_channels, timeout_cycles, gpu_ctx);
+                        comm_stream, num_channels, timeout_cycles,
+                        dpa_state ? dpa_dispatch(static_cast<DpaState*>(dpa_state), gpu_ctx, rdma_rank, num_rdma_ranks,
+                                                 num_channels, hidden_int4 * 16, num_scales, num_topk,
+                                                 config.num_max_rdma_chunked_recv_tokens,
+                                                 config.num_max_rdma_chunked_send_tokens, num_tokens, x.data_ptr(), x)
+                                  : gpu_ctx);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1529,6 +1761,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<nixl_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, bool, bool, int>())
         .def("update_memory_buffers", &nixl_ep::Buffer::update_memory_buffers)
+        .def("dpa_init", &nixl_ep::Buffer::dpa_init)
         .def("barrier", &nixl_ep::Buffer::barrier)
         .def("connect_ranks", [](nixl_ep::Buffer &buffer, const std::vector<int>& remote_ranks, const std::optional<std::vector<pybind11::bytes>>& remote_mds, const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles, bool activate) {
             buffer.connect_ranks(remote_ranks, nixl_ep::convert_mds(remote_mds), all_gathered_handles, activate);

@@ -113,6 +113,11 @@ nixl_ep_cuda_args = [
     '-Xcompiler', '-Wno-attributes',
 ]
 
+dpa_inc = get_option('nixl_ep_dpa_inc')
+if dpa_inc != ''
+    nixl_ep_cpp_args += ['-DNIXL_EP_DPA', '-I' + dpa_inc, '-I' + get_option('nixl_ep_doca_inc')]
+endif
+
 nvl_peers = get_option('nixl_ep_nvl_peers').to_string()
 nixl_ep_cpp_args += ['-DNUM_MAX_NVL_PEERS=' + nvl_peers]
 nixl_ep_cuda_args += ['-DNUM_MAX_NVL_PEERS=' + nvl_peers]

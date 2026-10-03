@@ -50,4 +50,6 @@ option('build_tests', type: 'boolean', value: true, description: 'Build all test
 option('build_examples', type: 'boolean', value: true, description: 'Build all examples')
 option('build_nixl_ep', type: 'boolean', value: false, description: 'Build nixl_ep example (requires sm_90 or newer)')
 option('nixl_ep_nvl_peers', type: 'integer', value: 8, min: 4, max: 8, description: 'nixl_ep NVLink group size: 8 (default) or 4 (one GB200 node)')
+option('nixl_ep_dpa_inc', type: 'string', value: '', description: 'nixl_ep: libepdpa include dir (epdpa.h); enables the DPA offload of the HT dispatch RDMA leg (NIXL_EP_DPA=1)')
+option('nixl_ep_doca_inc', type: 'string', value: '/opt/mellanox/doca/include', description: 'nixl_ep: DOCA include dir for the DPA offload')
 option('test_all_plugins', type: 'boolean', value: false, description: 'Testing all plugins in addition to the mocks..')

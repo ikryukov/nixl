@@ -168,6 +168,8 @@ private:
     std::vector<NixlPeerInfo> nixl_peer_info;
     NixlPeerInfo my_peer_info;
     nixl_ep::gpu_nixl_ctx gpu_ctx;
+    void* dpa_state = nullptr; // struct DpaState (nixl_ep.cpp), DPA offload of the HT dispatch RDMA leg
+    size_t dpa_scratch_bytes = 0;
     NixlMemoryViews active_memory_views;
     NixlMemoryViews staged_memory_views;
     nixl_ep::gpu_nixl_ctx* gpu_ctx_ptr = nullptr;
@@ -196,6 +198,8 @@ private:
 
 public:
     Buffer(int rank, bool explicitly_destroy, bool low_latency_mode, int timeout_ms);
+
+    void dpa_init(const pybind11::function& all_gather_object);
 
     void update_memory_buffers(int num_ranks, int num_experts_per_rank, int64_t num_rdma_bytes, int64_t num_nvl_bytes = 0);
 

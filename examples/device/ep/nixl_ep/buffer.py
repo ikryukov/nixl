@@ -842,6 +842,10 @@ class Buffer:
         else:
             self.runtime.connect_ranks(remote_ranks, None, ipc_handles)
 
+        # DPA offload of the dispatch RDMA leg (NIXL_EP_DPA=1, NIXL_EP_DPA_LIB=<libepdpa.so>)
+        if os.getenv("NIXL_EP_DPA", "0") == "1":
+            self.runtime.dpa_init(all_gather_object)
+
     def connect_ranks(self, remote_ranks: List[int], activate: bool = True) -> None:
         """
         Add connections to remote ranks.
