@@ -157,7 +157,8 @@ void dispatch(void* recv_x,
               cudaStream_t stream,
               int num_channels,
               uint64_t timeout_cycles,
-              gpu_nixl_ctx nixl_ctx);
+              gpu_nixl_ctx nixl_ctx,
+              bool fused = false);
 
 void cached_notify(int hidden_int4,
                    int num_scales,

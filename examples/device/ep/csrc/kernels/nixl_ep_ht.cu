@@ -471,12 +471,16 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
     return num_rdma_ranks < 8 ? num_rdma_ranks : 8;
 }
 
+// kFused (DPA mode only): one block per channel instead of a sender block + a forwarder block. Warps: [0, S) RDMA
+// senders, S sender coordinator, then P NVL receivers, P forwarders and the forwarder coordinator.
 template <int kNumRDMARanks,
           bool kCachedMode,
           int kNumTMABytesPerWarp,
           int kNumDispatchRDMASenderWarps,
+          bool kFused = false,
           int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
-__global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
+__global__ void __launch_bounds__(((kFused ? kNumDispatchRDMASenderWarps + 2 + 2 * NUM_MAX_NVL_PEERS
+                                           : kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
     dispatch(int4* recv_x,
              float* recv_x_scales,
              topk_idx_t* recv_topk_idx,
@@ -518,12 +522,24 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
-    const auto num_channels = num_sms / 2, channel_id = sm_id / 2;
+    const auto num_channels = kFused ? num_sms : num_sms / 2, channel_id = kFused ? sm_id : sm_id / 2;
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
 
 
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
+        if constexpr (kFused) {
+            constexpr int S = kNumDispatchRDMASenderWarps, P = NUM_MAX_NVL_PEERS;
+            if (warp_id < S)
+                return {WarpRole::kRDMASender, -1};
+            if (warp_id == S)
+                return {WarpRole::kRDMASenderCoordinator, -1};
+            if (warp_id < S + 1 + P)
+                return {WarpRole::kNVLReceivers, (warp_id - (S + 1) + channel_id) % P};
+            if (warp_id < S + 1 + 2 * P)
+                return {WarpRole::kRDMAAndNVLForwarder, (warp_id - (S + 1 + P) + channel_id) % P};
+            return {WarpRole::kForwarderCoordinator, 0};
+        }
         if (is_forwarder) {
             if (warp_id < NUM_MAX_NVL_PEERS) {
                 return {WarpRole::kRDMAAndNVLForwarder, (warp_id + channel_id) % NUM_MAX_NVL_PEERS};
@@ -540,7 +556,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     }();
     auto warp_role = role_meta.first;
     auto target_rank = role_meta.second;  // Not applicable for RDMA senders
-    EP_DEVICE_ASSERT(num_warps == kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS);
+    EP_DEVICE_ASSERT(num_warps == (kFused ? kNumDispatchRDMASenderWarps + 2 + 2 * NUM_MAX_NVL_PEERS
+                                          : kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS));
 
     // Data checks
     EP_DEVICE_ASSERT(num_topk <= 32);
@@ -600,7 +617,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
     // TMA stuffs
     extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
-    auto tma_buffer = smem_tma_buffer + target_rank * kNumTMABytesPerWarp;
+    const int tma_slot = (kFused and warp_role == WarpRole::kNVLReceivers ? NUM_MAX_NVL_PEERS : 0) + target_rank;
+    auto tma_buffer = smem_tma_buffer + tma_slot * kNumTMABytesPerWarp;
     auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + num_bytes_per_token);
     uint32_t tma_phase = 0;
     if ((warp_role == WarpRole::kRDMAAndNVLForwarder or warp_role == WarpRole::kNVLReceivers) and elect_one_sync()) {
@@ -1356,10 +1374,11 @@ void dispatch(void* recv_x,
               cudaStream_t stream,
               int num_channels,
               uint64_t timeout_cycles,
-              gpu_nixl_ctx nixl_ctx) {
+              gpu_nixl_ctx nixl_ctx,
+              bool fused) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
+    constexpr int kNumFusedSenderWarps = 4;
     constexpr int kNumTMABytesPerWarp = 16384;
-    constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
 
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
@@ -1367,8 +1386,8 @@ void dispatch(void* recv_x,
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                               \
 {                                                                                          \
     auto dispatch_func = is_cached_dispatch ?                                              \
-        dispatch<num_rdma_ranks, true, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps> : \
-        dispatch<num_rdma_ranks, false, kNumTMABytesPerWarp, kNumDispatchRDMASenderWarps>; \
+        dispatch<num_rdma_ranks, true, kNumTMABytesPerWarp, kSenderWarps, kFusedLaunch> :  \
+        dispatch<num_rdma_ranks, false, kNumTMABytesPerWarp, kSenderWarps, kFusedLaunch>;  \
     SET_SHARED_MEMORY_FOR_TMA(dispatch_func);                                              \
     LAUNCH_KERNEL(&cfg,                                                                    \
                   dispatch_func,                                                           \
@@ -1413,8 +1432,24 @@ break
     EP_HOST_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
     EP_HOST_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
 
-    SETUP_LAUNCH_CONFIG(num_channels * 2, (kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32, stream);
-    SWITCH_RDMA_RANKS(DISPATCH_LAUNCH_CASE);
+    if (fused) {
+        // DPA mode, one block per channel: forwarders and NVL receivers share the block, each with its own TMA buffer
+        constexpr int kSenderWarps = kNumFusedSenderWarps;
+        constexpr bool kFusedLaunch = true;
+        constexpr int smem_size = 2 * kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
+        int device = 0, max_smem = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        EP_HOST_ASSERT(smem_size <= max_smem and "fused dispatch needs 2 x NVL peers TMA buffers (NVL group of 4)");
+        SETUP_LAUNCH_CONFIG(num_channels, (kSenderWarps + 2 + 2 * NUM_MAX_NVL_PEERS) * 32, stream);
+        SWITCH_RDMA_RANKS(DISPATCH_LAUNCH_CASE);
+    } else {
+        constexpr int kSenderWarps = kNumDispatchRDMASenderWarps;
+        constexpr bool kFusedLaunch = false;
+        constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
+        SETUP_LAUNCH_CONFIG(num_channels * 2, (kSenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32, stream);
+        SWITCH_RDMA_RANKS(DISPATCH_LAUNCH_CASE);
+    }
 #undef DISPATCH_LAUNCH_CASE
 }
 

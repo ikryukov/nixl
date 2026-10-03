@@ -117,7 +117,9 @@ int Buffer::get_rank_bound(std::optional<int> num_experts) const {
 // One DPA stream per (channel, remote rdma rank) gathers x | scales | SourceMeta | topk of every token the
 // dispatch kernel publishes in the stream's mailbox straight into the peer's ring slot, waits for ring credit
 // on head.buffer(dst) and adds the tokens posted so far to the peer's tail.buffer(my rdma rank) (atomic fetch-add).
-static constexpr int kDpaChannels = 16, kDpaMaxBlocks = 128, kDpaMaxBlockTokens = 128, kDpaMaxInflight = 8;
+// One QP tag per channel: up to 32 channels when the engine has as many tags.
+static constexpr int kDpaChannels = EPDPA_MAX_TAGS < 32 ? EPDPA_MAX_TAGS : 32;
+static constexpr int kDpaMaxBlocks = 128, kDpaMaxBlockTokens = 128, kDpaMaxInflight = 8;
 static constexpr int kDpaMaxTopK = 128, kDpaMaxScales = 128;
 static constexpr size_t kDpaAlign = 1 << 16;
 
@@ -175,7 +177,12 @@ struct DpaState {
     std::vector<doca_dpa_dev_completion_t> comp;
     std::map<std::tuple<int, int, int, int>, std::pair<uint64_t, int>> launch_streams; // (channels, bpt, ring, block|sig)
     uint64_t round = 0;
+    bool fused = false; // NIXL_EP_DPA_FUSED=1: one block per channel (see the dispatch kernel)
 };
+
+static bool dpa_fused(const void* state) {
+    return state != nullptr and static_cast<const DpaState*>(state)->fused;
+}
 
 static int dpa_allgather_cb(void* user, void* buf, size_t elem) {
     auto* d = static_cast<DpaState*>(user);
@@ -209,6 +216,7 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
 #undef DPA_SYM
     d->ag = &all_gather_object;
     d->rank = rank;
+    d->fused = std::getenv("NIXL_EP_DPA_FUSED") and std::string(std::getenv("NIXL_EP_DPA_FUSED")) == "1";
     d->base = static_cast<uint8_t*>(rdma_buffer_ptr);
     d->scratch_off = dpa_scratch_offset(num_rdma_bytes);
     d->layout = DpaScratch(num_rdma_ranks);
@@ -237,7 +245,8 @@ void Buffer::dpa_init(const pybind11::function& all_gather_object) {
     d->ag = nullptr;
     dpa_state = d;
     if (rank == 0)
-        printf("[nixl_ep] DPA offload of the HT dispatch RDMA leg: %d QPs, scratch %.1f MB\n", n, dpa_scratch_bytes / 1e6);
+        printf("[nixl_ep] DPA offload of the HT dispatch RDMA leg: %d QPs, scratch %.1f MB%s\n", n,
+               dpa_scratch_bytes / 1e6, d->fused ? ", fused (1 SM per channel)" : "");
 
     const auto& L = d->layout;
     uint8_t* s = d->base + d->scratch_off;
@@ -324,6 +333,7 @@ static nixl_ep::gpu_nixl_ctx dpa_dispatch(DpaState* d, nixl_ep::gpu_nixl_ctx ctx
 size_t dpa_scratch_offset(int64_t num_rdma_bytes) { return static_cast<size_t>(num_rdma_bytes); }
 size_t dpa_scratch_size(int) { return 0; }
 struct DpaState {};
+static bool dpa_fused(const void*) { return false; }
 void Buffer::dpa_init(const pybind11::function&) {
     throw std::runtime_error("NIXL_EP_DPA=1 needs nixl_ep built with -Dnixl_ep_dpa_inc=<libepdpa include dir>");
 }
@@ -1087,7 +1097,8 @@ Buffer::ht_dispatch(const torch::Tensor& x, const std::optional<torch::Tensor>& 
                                                  num_channels, hidden_int4 * 16, num_scales, num_topk,
                                                  config.num_max_rdma_chunked_recv_tokens,
                                                  config.num_max_rdma_chunked_send_tokens, num_tokens, x.data_ptr(), x)
-                                  : gpu_ctx);
+                                  : gpu_ctx,
+                        dpa_fused(dpa_state));
 
     // Wait streams
     std::optional<EventHandle> event;
