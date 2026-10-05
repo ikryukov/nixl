@@ -215,11 +215,6 @@ static bool dpa_fused(const void* state) {
     return state != nullptr and static_cast<const DpaState*>(state)->fused;
 }
 
-// The glue exchanges pairwise through the TCP store; the engine's allgather (epdpa_connect) is not used.
-static int dpa_no_allgather(void*, void*, size_t) {
-    return -1;
-}
-
 // ponytail: keys are unique per pair and generation only; a re-created Buffer or a replaced rank restarts at
 // generation 0 and would read stale keys. Add an epoch (e.g. a store.add() counter) to the prefix when that has to work.
 static std::string dpa_key(const char* kind, int gen, int from, int to) {
@@ -416,8 +411,7 @@ void Buffer::dpa_init(const pybind11::function& kv_set, const pybind11::function
     d->scratch_off = dpa_scratch_offset(num_rdma_bytes);
     d->layout = DpaScratch(num_rdma_ranks);
     const size_t total = d->scratch_off + dpa_scratch_bytes;
-    EP_HOST_ASSERT(
-        d->core_create(&d->core, rank, num_rdma_ranks * NUM_MAX_NVL_PEERS, device_id, dpa_no_allgather, nullptr) == 0);
+    EP_HOST_ASSERT(d->core_create(&d->core, rank, device_id) == 0);
     d->mr = d->reg(d->core, d->base, total, 1);
     d->sig_mr = d->reg(d->core, d->base, total, 0); // tail signals must land after the data: no relaxed ordering
     EP_HOST_ASSERT(d->mr and d->sig_mr and d->window(d->core, d->base, total, &d->mm) == 0);
